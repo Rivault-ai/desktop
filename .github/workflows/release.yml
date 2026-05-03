@@ -1,0 +1,164 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to (re)build, e.g. v0.1.0"
+        required: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm -F @rivault/api exec prisma generate
+
+      - name: Build skill (TypeScript)
+        run: pnpm -F rivault build
+
+      - name: Build Tauri app (universal)
+        run: pnpm -F @rivault/desktop tauri build --target universal-apple-darwin
+        env:
+          CI: "true"
+
+      - name: Stage skill directory
+        run: |
+          mkdir -p stage
+          # `--legacy` is required from pnpm v10+ when the workspace doesn't
+          # opt into inject-workspace-packages. Produces a self-contained dir
+          # with prod deps inlined under node_modules/.
+          pnpm --filter rivault deploy --prod --legacy stage/skill
+          # Drop devtime metadata that doesn't belong in a runtime install
+          rm -rf stage/skill/src stage/skill/scripts
+
+      - name: Stage release zip
+        run: |
+          set -euo pipefail
+          mkdir -p stage
+          APP_SRC="packages/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/Rivault.app"
+          if [ ! -d "$APP_SRC" ]; then
+            echo "Tauri build did not produce $APP_SRC" >&2
+            ls -la packages/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/ || true
+            exit 1
+          fi
+          cp -R "$APP_SRC" stage/Rivault.app
+          # skill was already staged into stage/skill earlier
+          cd stage
+          # Use ditto so xattrs + symlinks survive the round-trip on macOS.
+          # Single archive contains both Rivault.app and skill/ siblings; the
+          # Cask postflight + install.sh both peel them apart.
+          ditto -c -k --sequesterRsrc . ../Rivault-darwin.zip
+          cd ..
+          shasum -a 256 Rivault-darwin.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            Rivault-darwin.zip
+            checksums.txt
+
+      - name: Expose artifact metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          APP_SHA=$(awk '/Rivault-darwin.zip$/ {print $1}' checksums.txt)
+          echo "app_sha=$APP_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Bump Homebrew Cask formula
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VER: ${{ steps.ver.outputs.version }}
+          APP_SHA: ${{ steps.meta.outputs.app_sha }}
+        run: |
+          set -euo pipefail
+          VERSION_NUM="${VER#v}"
+          REPO_DIR="$(mktemp -d)"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/Rivault-ai/homebrew-tap.git" "$REPO_DIR"
+          mkdir -p "$REPO_DIR/Casks"
+          cat > "$REPO_DIR/Casks/rivault.rb" <<EOF
+          cask "rivault" do
+            version "${VERSION_NUM}"
+            sha256 "${APP_SHA}"
+
+            url "https://github.com/${{ github.repository }}/releases/download/v#{version}/Rivault-darwin.zip"
+            name "Rivault"
+            desc "Local secrets daemon for AI agents"
+            homepage "https://github.com/${{ github.repository }}"
+
+            depends_on macos: ">= :big_sur"
+
+            app "Rivault.app"
+
+            postflight do
+              skill_src = Pathname.new("#{staged_path}/skill")
+              skill_dst = Pathname.new("#{Dir.home}/.openclaw/skills/rivault")
+              if skill_src.directory?
+                skill_dst.dirname.mkpath
+                FileUtils.rm_rf(skill_dst)
+                FileUtils.cp_r(skill_src, skill_dst)
+              end
+            end
+
+            uninstall quit: "ai.rivault.daemon"
+
+            zap trash: [
+              "~/Library/Application Support/Rivault",
+              "~/.openclaw/skills/rivault",
+              "~/Library/Preferences/ai.rivault.daemon.plist",
+            ]
+
+            caveats <<~EOS
+              Rivault installed. Open the app and paste your API key on first launch:
+                open -a Rivault
+
+              Get an API key at https://rivault.ai
+            EOS
+          end
+          EOF
+          cd "$REPO_DIR"
+          git config user.email "release-bot@rivault.ai"
+          git config user.name "rivault-release-bot"
+          git add Casks/rivault.rb
+          if git diff --staged --quiet; then
+            echo "No formula changes to commit"
+          else
+            git commit -m "rivault ${VERSION_NUM}"
+            git push origin HEAD
+          fi

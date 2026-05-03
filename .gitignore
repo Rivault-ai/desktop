@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# Tauri build outputs
+packages/desktop/src-tauri/target/
+packages/desktop/dist/
+
+# Local dev scratch
+.context/
+scripts/smoke-*.mjs
+scripts/smoke-*.ts
+scripts/smoke-*.js

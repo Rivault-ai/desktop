@@ -1,0 +1,33 @@
+{
+  "name": "rivault",
+  "version": "0.1.0",
+  "description": "Rivault secure vault skill for OpenClaw — lets AI agents securely access user secrets with authorization",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "skills",
+    "scripts",
+    "openclaw.plugin.json",
+    "SKILL.md",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["openclaw", "rivault", "vault", "security", "skill", "secrets"],
+  "license": "MIT",
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.15.7",
+    "typescript": "^5.4.5"
+  }
+}

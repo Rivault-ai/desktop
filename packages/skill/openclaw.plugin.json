@@ -1,0 +1,32 @@
+{
+  "id": "rivault",
+  "name": "Rivault",
+  "description": "Secure vault access for AI agents — retrieve secrets, passwords, API keys, and personal data with Face ID authorization flows.",
+  "skills": ["./skills"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiKey": {
+        "type": "string"
+      },
+      "apiUrl": {
+        "type": "string"
+      }
+    }
+  },
+  "uiHints": {
+    "apiKey": {
+      "label": "Rivault API Key",
+      "sensitive": true,
+      "placeholder": "rv_...",
+      "help": "Agent API key from your Rivault dashboard (or use ${RIVAULT_API_KEY})"
+    },
+    "apiUrl": {
+      "label": "Rivault API URL",
+      "placeholder": "https://api.rivault.ai (default)",
+      "help": "Base URL of your Rivault API instance",
+      "advanced": true
+    }
+  }
+}
