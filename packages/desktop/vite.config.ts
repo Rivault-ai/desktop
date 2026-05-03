@@ -8,6 +8,11 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
+  // Tauri 2 loads bundled HTML through a custom protocol. Absolute asset
+  // URLs (`/assets/foo.js`) don't resolve there and the window renders blank;
+  // emitting relative paths fixes that.
+  base: "./",
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
