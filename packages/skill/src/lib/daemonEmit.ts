@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
+import { readdir, readFile, stat } from 'node:fs/promises'
 import { homedir, platform } from 'node:os'
 import { join } from 'node:path'
 
@@ -90,13 +90,90 @@ function detectRuntime(): DaemonReleaseEvent['agent_runtime'] {
   return 'openclaw'
 }
 
-function transcriptPaths(): string[] {
+/**
+ * Scan a directory tree for the most-recently-modified .jsonl file.
+ *
+ * Used to autodiscover the active transcript for a runtime when no env var
+ * advertises it (which is the norm — OpenClaw/Codex/Claude Code don't set
+ * one). The "most recent .jsonl" heuristic is reliable in practice because
+ * agents append to the active session in real time, so its mtime is always
+ * the latest.
+ */
+async function mostRecentJsonl(root: string, recursive: boolean): Promise<string | null> {
+  let best: { path: string; mtime: number } | null = null
+  const stack: string[] = [root]
+  while (stack.length > 0) {
+    const dir = stack.pop()!
+    let entries: import('node:fs').Dirent[]
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const e of entries) {
+      const full = join(dir, e.name)
+      if (e.isDirectory()) {
+        if (recursive) stack.push(full)
+        continue
+      }
+      if (!e.isFile() || !e.name.endsWith('.jsonl')) continue
+      try {
+        const st = await stat(full)
+        if (!best || st.mtimeMs > best.mtime) {
+          best = { path: full, mtime: st.mtimeMs }
+        }
+      } catch {}
+    }
+  }
+  return best?.path ?? null
+}
+
+/**
+ * Resolve transcript paths for the detected runtime.
+ *
+ * Env-var hints (OPENCLAW_TRANSCRIPT_PATH, CLAUDE_TRANSCRIPT_PATH,
+ * CODEX_TRANSCRIPT_PATH) take precedence — they're the most authoritative
+ * signal a runtime can give us. Falls back to autodiscovery in the
+ * runtime's well-known session directory.
+ *
+ * Claude Desktop and ChatGPT Desktop are deliberately not handled here:
+ * their transcripts live in LevelDB / proprietary .data blobs we can't
+ * safely edit. The daemon will mark releases from those runtimes as
+ * unsupported_runtime in the ledger.
+ */
+async function resolveTranscriptPaths(
+  runtime: DaemonReleaseEvent['agent_runtime'],
+): Promise<string[]> {
+  // Honor explicit env hints first.
   const out: string[] = []
-  for (const k of ['CLAUDE_TRANSCRIPT_PATH', 'CODEX_TRANSCRIPT_PATH', 'OPENCLAW_TRANSCRIPT_PATH']) {
+  for (const k of ['OPENCLAW_TRANSCRIPT_PATH', 'CLAUDE_TRANSCRIPT_PATH', 'CODEX_TRANSCRIPT_PATH']) {
     const v = process.env[k]
     if (v) out.push(v)
   }
-  return out
+  if (out.length > 0) return out
+
+  const home = homedir()
+  let dir: string | null = null
+  let recursive = false
+  switch (runtime) {
+    case 'openclaw':
+      dir = join(home, '.openclaw', 'agents', 'main', 'sessions')
+      break
+    case 'claude-code':
+      dir = join(home, '.claude', 'projects')
+      recursive = true
+      break
+    case 'codex':
+      dir = join(home, '.codex', 'sessions')
+      recursive = true
+      break
+    case 'claude-desktop':
+    case 'custom':
+      return []
+  }
+  if (!dir) return []
+  const recent = await mostRecentJsonl(dir, recursive)
+  return recent ? [recent] : []
 }
 
 export async function emitRelease(input: ReleaseEventInput): Promise<void> {
@@ -115,18 +192,19 @@ export async function emitRelease(input: ReleaseEventInput): Promise<void> {
     input.apiKeyId ??
     randomUUID()
 
+  const runtime = detectRuntime()
   const event: DaemonReleaseEvent = {
     release_id: randomUUID(),
     session_id: sessionId,
     tier: input.tier === 'L1' ? 'l1' : 'l2',
-    agent_runtime: detectRuntime(),
+    agent_runtime: runtime,
     // mcp_mode null = not running through MCP; only the API-server-side
     // MCP tool path sets envelope-verbatim / server-decrypt.
     mcp_mode: null,
     value_plaintext: input.plaintext,
     value_hash: createHash('sha256').update(input.plaintext ?? '').digest('hex'),
     encoded_variants: [],
-    transcript_paths: transcriptPaths(),
+    transcript_paths: await resolveTranscriptPaths(runtime),
     released_at: new Date().toISOString(),
     rotation_supported: false,
   }

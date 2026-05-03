@@ -10,6 +10,7 @@
 //! 6. On verify failure (or out-of-band rotation flag) → enqueue rotation
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
@@ -43,6 +44,24 @@ impl Daemon {
     pub fn accept(self: &Arc<Self>, event: ReleaseEvent, channel: Channel) -> Result<String> {
         let validated = self.validate(&event)?;
 
+        // Snapshot file size at release time. The scrubber later confines its
+        // edits to bytes written after this point so existing pre-release
+        // content (and the user's older saves) stay byte-identical.
+        let mut transcript_offsets: HashMap<String, u64> = HashMap::new();
+        for path in &validated {
+            let key = path.display().to_string();
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    transcript_offsets.insert(key, meta.len());
+                }
+                Err(_) => {
+                    // File doesn't exist yet — treat as offset 0 so the
+                    // entire file is in the task window when it's created.
+                    transcript_offsets.insert(key, 0);
+                }
+            }
+        }
+
         let entry = LedgerEntry {
             release_id: event.release_id.clone(),
             session_id: event.session_id.clone(),
@@ -53,6 +72,7 @@ impl Daemon {
             channel,
             plaintext_seen_locally: event.value_plaintext.is_some(),
             transcript_paths: validated.iter().map(|p| p.display().to_string()).collect(),
+            transcript_offsets: transcript_offsets.clone(),
             released_at: event.released_at.clone(),
             scrubbed_at: None,
             rotated_at: None,
@@ -80,7 +100,7 @@ impl Daemon {
 
         tokio::spawn(async move {
             if let Err(e) = me
-                .run_lifecycle(release_id, paths, needles, rotation_supported)
+                .run_lifecycle(release_id, paths, needles, transcript_offsets, rotation_supported)
                 .await
             {
                 tracing::error!("release lifecycle: {e:#}");
@@ -105,6 +125,7 @@ impl Daemon {
         release_id: String,
         paths: Vec<PathBuf>,
         needles: Vec<String>,
+        offsets: HashMap<String, u64>,
         rotation_supported: bool,
     ) -> Result<()> {
         let watcher_rx = if !paths.is_empty() {
@@ -127,7 +148,7 @@ impl Daemon {
         let scrub_outcome = if needles.is_empty() {
             ScrubOutcome::Skipped
         } else {
-            match scrub_paths(&path_strs, &needles) {
+            match scrub_paths(&path_strs, &needles, &offsets) {
                 Ok(report) => {
                     if report.verified {
                         ScrubOutcome::Verified
@@ -168,10 +189,11 @@ impl Daemon {
             let needles: Vec<String> = Vec::new();
             let paths: Vec<PathBuf> =
                 entry.transcript_paths.iter().map(PathBuf::from).collect();
+            let offsets = entry.transcript_offsets.clone();
             let me = Arc::clone(self);
             tokio::spawn(async move {
                 let _ = me
-                    .run_lifecycle(entry.release_id, paths, needles, false)
+                    .run_lifecycle(entry.release_id, paths, needles, offsets, false)
                     .await;
             });
         }

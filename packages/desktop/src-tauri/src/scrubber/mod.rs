@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -63,7 +63,27 @@ pub struct ScrubReport {
     pub verified: bool,
 }
 
-pub fn scrub_paths(paths: &[String], needles: &[String]) -> Result<ScrubReport> {
+/// Scrub the given paths.
+///
+/// `offsets` records the file size at the moment the release was accepted.
+/// We scrub only bytes written *after* that offset — the task window — so
+/// older content the user wrote before the agent retrieved a value is left
+/// byte-identical. Files not present in `offsets` (e.g. the path is a
+/// directory we recursed into) are scrubbed in full.
+///
+/// Three integrity checks before we overwrite:
+/// 1. File still UTF-8 (skip if binary now)
+/// 2. Current size >= stored offset (otherwise the file was truncated/
+///    rotated underneath us — fall back to full-file scrub on the new file
+///    since we have no idea where the task-window suffix begins)
+/// 3. Verify pass after rewrite confirms no needle remains anywhere in the
+///    suffix; if any does, the report is marked unverified and the
+///    orchestrator can enqueue rotation.
+pub fn scrub_paths(
+    paths: &[String],
+    needles: &[String],
+    offsets: &HashMap<String, u64>,
+) -> Result<ScrubReport> {
     if needles.is_empty() {
         return Err(anyhow!("no needles to scrub"));
     }
@@ -74,36 +94,63 @@ pub fn scrub_paths(paths: &[String], needles: &[String]) -> Result<ScrubReport> 
             continue;
         }
         if path.is_dir() {
-            scrub_dir(path, needles, &mut report)?;
+            scrub_dir(path, needles, offsets, &mut report)?;
         } else {
-            scrub_one(path, needles, &mut report)?;
+            let start = offsets.get(p).copied().unwrap_or(0);
+            scrub_one(path, needles, start, &mut report)?;
         }
     }
-    report.verified = verify(paths, needles)?;
+    report.verified = verify(paths, needles, offsets)?;
     Ok(report)
 }
 
-fn scrub_dir(dir: &Path, needles: &[String], report: &mut ScrubReport) -> Result<()> {
+fn scrub_dir(
+    dir: &Path,
+    needles: &[String],
+    offsets: &HashMap<String, u64>,
+    report: &mut ScrubReport,
+) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
         if p.is_dir() {
-            scrub_dir(&p, needles, report)?;
+            scrub_dir(&p, needles, offsets, report)?;
         } else {
-            scrub_one(&p, needles, report)?;
+            // Files inside a watched directory don't have per-path offsets
+            // (the orchestrator only snapshots explicit transcript paths),
+            // so fall back to full-file scrub for these.
+            let start = offsets.get(&p.display().to_string()).copied().unwrap_or(0);
+            scrub_one(&p, needles, start, report)?;
         }
     }
     Ok(())
 }
 
-fn scrub_one(path: &Path, needles: &[String], report: &mut ScrubReport) -> Result<()> {
+fn scrub_one(
+    path: &Path,
+    needles: &[String],
+    start: u64,
+    report: &mut ScrubReport,
+) -> Result<()> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(_) => return Ok(()), // best effort; skip unreadable
     };
-    let Ok(mut s) = String::from_utf8(bytes) else {
-        return Ok(()); // skip binary
+    // Truncation / rotation guard: if the file shrunk below our snapshot,
+    // the original task-window suffix is gone. Whatever's there now is
+    // entirely "new" — scrub the whole thing rather than crashing on
+    // out-of-range slicing.
+    let effective_start = if (start as usize) <= bytes.len() {
+        start as usize
+    } else {
+        0
     };
+    let prefix = &bytes[..effective_start];
+    let suffix = &bytes[effective_start..];
+    let Ok(suffix_str) = std::str::from_utf8(suffix) else {
+        return Ok(()); // skip binary suffix
+    };
+    let mut s = suffix_str.to_string();
     let mut hits = 0;
     for n in needles {
         let count = s.matches(n.as_str()).count();
@@ -113,50 +160,79 @@ fn scrub_one(path: &Path, needles: &[String], report: &mut ScrubReport) -> Resul
         }
     }
     if hits > 0 {
-        fs::write(path, s)?;
+        // Reassemble: untouched prefix + scrubbed suffix.
+        let mut out = Vec::with_capacity(prefix.len() + s.len());
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(s.as_bytes());
+        fs::write(path, out)?;
         report.files_modified.push(path.display().to_string());
         report.total_replacements += hits;
     }
     Ok(())
 }
 
-fn verify(paths: &[String], needles: &[String]) -> Result<bool> {
+/// Verify pass — confirms no needle survives in the task-window suffix.
+///
+/// We deliberately only check the suffix, not the whole file. Pre-release
+/// content that happens to contain a needle (e.g. the user pasted the same
+/// password into a chat days ago) is none of the daemon's business — we
+/// want to verify the redaction we *did*, not all historical occurrences.
+fn verify(
+    paths: &[String],
+    needles: &[String],
+    offsets: &HashMap<String, u64>,
+) -> Result<bool> {
     for p in paths {
         let path = Path::new(p);
         if !path.exists() {
             continue;
         }
         if path.is_dir() {
-            if !verify_dir(path, needles)? {
+            if !verify_dir(path, needles, offsets)? {
                 return Ok(false);
             }
-        } else if !verify_one(path, needles)? {
-            return Ok(false);
+        } else {
+            let start = offsets.get(p).copied().unwrap_or(0);
+            if !verify_one(path, needles, start)? {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
 }
 
-fn verify_dir(dir: &Path, needles: &[String]) -> Result<bool> {
+fn verify_dir(
+    dir: &Path,
+    needles: &[String],
+    offsets: &HashMap<String, u64>,
+) -> Result<bool> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
         if p.is_dir() {
-            if !verify_dir(&p, needles)? {
+            if !verify_dir(&p, needles, offsets)? {
                 return Ok(false);
             }
-        } else if !verify_one(&p, needles)? {
-            return Ok(false);
+        } else {
+            let start = offsets.get(&p.display().to_string()).copied().unwrap_or(0);
+            if !verify_one(&p, needles, start)? {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
 }
 
-fn verify_one(path: &Path, needles: &[String]) -> Result<bool> {
+fn verify_one(path: &Path, needles: &[String], start: u64) -> Result<bool> {
     let Ok(bytes) = fs::read(path) else {
         return Ok(true);
     };
-    let Ok(s) = std::str::from_utf8(&bytes) else {
+    let effective_start = if (start as usize) <= bytes.len() {
+        start as usize
+    } else {
+        0
+    };
+    let Ok(s) = std::str::from_utf8(&bytes[effective_start..]) else {
         return Ok(true);
     };
     for n in needles {
@@ -181,6 +257,10 @@ mod tests {
         p
     }
 
+    fn no_offsets() -> HashMap<String, u64> {
+        HashMap::new()
+    }
+
     #[test]
     fn replaces_plaintext_and_base64() {
         let p = tmpfile(
@@ -188,7 +268,8 @@ mod tests {
             "leak hello@rivault.ai and aGVsbG9Acml2YXVsdC5haQ== then done",
         );
         let needles = build_needles(Some("hello@rivault.ai"), &[]);
-        let report = scrub_paths(&[p.display().to_string()], &needles).unwrap();
+        let report =
+            scrub_paths(&[p.display().to_string()], &needles, &no_offsets()).unwrap();
         assert!(report.verified);
         let after = fs::read_to_string(&p).unwrap();
         assert!(!after.contains("hello@rivault.ai"));
@@ -201,7 +282,7 @@ mod tests {
     fn handles_url_encoded() {
         let p = tmpfile("y.jsonl", "redirect=secret%40rivault.ai end");
         let needles = build_needles(Some("secret@rivault.ai"), &[]);
-        let _ = scrub_paths(&[p.display().to_string()], &needles).unwrap();
+        let _ = scrub_paths(&[p.display().to_string()], &needles, &no_offsets()).unwrap();
         let after = fs::read_to_string(&p).unwrap();
         assert!(!after.contains("secret%40rivault.ai"));
     }
@@ -209,9 +290,8 @@ mod tests {
     #[test]
     fn supplied_variants_only_path() {
         let p = tmpfile("z.jsonl", "ciphertext: AAAA== body BBBB done");
-        // Simulating true-E2E: no plaintext, just precomputed variants.
         let needles = build_needles(None, &["AAAA==".into(), "BBBB".into()]);
-        let _ = scrub_paths(&[p.display().to_string()], &needles).unwrap();
+        let _ = scrub_paths(&[p.display().to_string()], &needles, &no_offsets()).unwrap();
         let after = fs::read_to_string(&p).unwrap();
         assert!(!after.contains("AAAA=="));
         assert!(!after.contains("BBBB"));
@@ -220,7 +300,8 @@ mod tests {
     #[test]
     fn missing_path_is_ok() {
         let needles = build_needles(Some("x"), &[]);
-        let r = scrub_paths(&["/tmp/does-not-exist-xyz".into()], &needles).unwrap();
+        let r = scrub_paths(&["/tmp/does-not-exist-xyz".into()], &needles, &no_offsets())
+            .unwrap();
         assert!(r.verified);
         assert!(r.files_modified.is_empty());
     }
@@ -229,9 +310,54 @@ mod tests {
     fn longest_needle_wins() {
         let p = tmpfile("zz.jsonl", "abcdef and abc done");
         let needles = build_needles(None, &["abc".into(), "abcdef".into()]);
-        let _ = scrub_paths(&[p.display().to_string()], &needles).unwrap();
+        let _ = scrub_paths(&[p.display().to_string()], &needles, &no_offsets()).unwrap();
         let after = fs::read_to_string(&p).unwrap();
         assert!(!after.contains("abcdef"));
         assert!(!after.contains("abc"));
+    }
+
+    #[test]
+    fn task_window_preserves_pre_release_content() {
+        // Pre-release prefix already contains the same string the agent
+        // later retrieved (coincidence). Offset says the task window
+        // starts after that prefix — only the post-offset suffix is
+        // scrubbed.
+        let prefix = "older line: super-secret was already here\n";
+        let suffix = "task line: super-secret\n";
+        let p = tmpfile("window.jsonl", &format!("{prefix}{suffix}"));
+
+        let mut offsets = HashMap::new();
+        offsets.insert(p.display().to_string(), prefix.len() as u64);
+
+        let needles = build_needles(Some("super-secret"), &[]);
+        let report = scrub_paths(&[p.display().to_string()], &needles, &offsets).unwrap();
+
+        let after = fs::read_to_string(&p).unwrap();
+        // Pre-release line untouched
+        assert!(
+            after.starts_with(prefix),
+            "prefix changed unexpectedly: {after}"
+        );
+        // Suffix has the redaction marker
+        assert!(after.contains(REDACTION_MARKER));
+        assert_eq!(report.total_replacements, 1);
+        // Verify only checks the suffix, so it should still pass even though
+        // the marker-free pre-release occurrence is technically present.
+        assert!(report.verified);
+    }
+
+    #[test]
+    fn truncation_falls_back_to_full_file_scrub() {
+        // File shrunk below the recorded offset (rotation/rewrite). The
+        // scrubber should not panic and should treat the whole file as the
+        // task window.
+        let p = tmpfile("rotate.jsonl", "fresh content with secret123 in it");
+        let mut offsets = HashMap::new();
+        offsets.insert(p.display().to_string(), 9_999u64);
+        let needles = build_needles(Some("secret123"), &[]);
+        let r = scrub_paths(&[p.display().to_string()], &needles, &offsets).unwrap();
+        assert!(r.verified);
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(!after.contains("secret123"));
     }
 }

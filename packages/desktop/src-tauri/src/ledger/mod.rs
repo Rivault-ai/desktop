@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS releases (
     channel                 TEXT NOT NULL,
     plaintext_seen_locally  INTEGER NOT NULL,
     transcript_paths        TEXT NOT NULL,
+    transcript_offsets      TEXT,
     released_at             TEXT NOT NULL,
     scrubbed_at             TEXT,
     rotated_at              TEXT,
@@ -31,6 +33,13 @@ CREATE TABLE IF NOT EXISTS releases (
 CREATE INDEX IF NOT EXISTS idx_releases_open
   ON releases (released_at) WHERE scrubbed_at IS NULL;
 ";
+
+// Adds columns introduced after the v0 schema. ALTER TABLE ADD COLUMN is
+// idempotent here only because we wrap each in its own transaction and
+// silently ignore the duplicate-column error rusqlite raises on retry.
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE releases ADD COLUMN transcript_offsets TEXT",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerEntry {
@@ -43,6 +52,13 @@ pub struct LedgerEntry {
     pub channel: Channel,
     pub plaintext_seen_locally: bool,
     pub transcript_paths: Vec<String>,
+    /// File-size snapshot per `transcript_paths` at the moment the release
+    /// was accepted. Populated for runtimes that store transcripts in
+    /// append-only JSONL — used by the scrubber to confine redaction to
+    /// the task window so existing pre-release content stays untouched.
+    /// Empty / missing for older rows or runtimes we can't safely scope.
+    #[serde(default)]
+    pub transcript_offsets: HashMap<String, u64>,
     pub released_at: String,
     pub scrubbed_at: Option<String>,
     pub rotated_at: Option<String>,
@@ -88,6 +104,7 @@ impl Ledger {
         }
         let conn = Connection::open(&path).with_context(|| format!("open {path:?}"))?;
         conn.execute_batch(SCHEMA)?;
+        run_migrations(&conn);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -97,6 +114,7 @@ impl Ledger {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        run_migrations(&conn);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -104,12 +122,17 @@ impl Ledger {
 
     pub fn insert(&self, entry: &LedgerEntry) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let offsets_json = if entry.transcript_offsets.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&entry.transcript_offsets)?)
+        };
         conn.execute(
             "INSERT OR REPLACE INTO releases (
                 release_id, session_id, value_hash, tier, agent_runtime, mcp_mode,
-                channel, plaintext_seen_locally, transcript_paths, released_at,
-                scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                channel, plaintext_seen_locally, transcript_paths, transcript_offsets,
+                released_at, scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 entry.release_id,
                 entry.session_id,
@@ -124,6 +147,7 @@ impl Ledger {
                 entry.channel.as_str(),
                 entry.plaintext_seen_locally as i64,
                 serde_json::to_string(&entry.transcript_paths)?,
+                offsets_json,
                 entry.released_at,
                 entry.scrubbed_at,
                 entry.rotated_at,
@@ -163,8 +187,8 @@ impl Ledger {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT release_id, session_id, value_hash, tier, agent_runtime, mcp_mode,
-                    channel, plaintext_seen_locally, transcript_paths, released_at,
-                    scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
+                    channel, plaintext_seen_locally, transcript_paths, transcript_offsets,
+                    released_at, scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
              FROM releases WHERE release_id = ?",
             params![release_id],
             row_to_entry,
@@ -177,8 +201,8 @@ impl Ledger {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT release_id, session_id, value_hash, tier, agent_runtime, mcp_mode,
-                    channel, plaintext_seen_locally, transcript_paths, released_at,
-                    scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
+                    channel, plaintext_seen_locally, transcript_paths, transcript_offsets,
+                    released_at, scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
              FROM releases ORDER BY released_at DESC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![limit], row_to_entry)?;
@@ -193,8 +217,8 @@ impl Ledger {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT release_id, session_id, value_hash, tier, agent_runtime, mcp_mode,
-                    channel, plaintext_seen_locally, transcript_paths, released_at,
-                    scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
+                    channel, plaintext_seen_locally, transcript_paths, transcript_offsets,
+                    released_at, scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
              FROM releases WHERE scrubbed_at IS NULL ORDER BY released_at ASC",
         )?;
         let rows = stmt.query_map([], row_to_entry)?;
@@ -212,6 +236,7 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<LedgerEntry> {
     let mcp_mode_s: Option<String> = row.get(5)?;
     let channel_s: String = row.get(6)?;
     let paths_s: String = row.get(8)?;
+    let offsets_s: Option<String> = row.get(9)?;
     Ok(LedgerEntry {
         release_id: row.get(0)?,
         session_id: row.get(1)?,
@@ -222,12 +247,27 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<LedgerEntry> {
         channel: Channel::parse(&channel_s),
         plaintext_seen_locally: row.get::<_, i64>(7)? != 0,
         transcript_paths: serde_json::from_str(&paths_s).unwrap_or_default(),
-        released_at: row.get(9)?,
-        scrubbed_at: row.get(10)?,
-        rotated_at: row.get(11)?,
-        trigger_that_fired: row.get(12)?,
-        scrub_verified: row.get::<_, i64>(13)? != 0,
+        transcript_offsets: offsets_s
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        released_at: row.get(10)?,
+        scrubbed_at: row.get(11)?,
+        rotated_at: row.get(12)?,
+        trigger_that_fired: row.get(13)?,
+        scrub_verified: row.get::<_, i64>(14)? != 0,
     })
+}
+
+fn run_migrations(conn: &Connection) {
+    for stmt in MIGRATIONS {
+        if let Err(e) = conn.execute(stmt, []) {
+            // Duplicate column on second open is expected; only log other errors.
+            let s = e.to_string();
+            if !s.contains("duplicate column") {
+                tracing::warn!("ledger migration `{stmt}` failed: {s}");
+            }
+        }
+    }
 }
 
 fn ledger_path() -> Result<PathBuf> {
@@ -252,6 +292,7 @@ mod tests {
             channel: Channel::Ipc,
             plaintext_seen_locally: true,
             transcript_paths: vec!["/tmp/x.jsonl".into()],
+            transcript_offsets: HashMap::from([("/tmp/x.jsonl".to_string(), 100u64)]),
             released_at: "2026-05-01T00:00:00Z".into(),
             scrubbed_at: None,
             rotated_at: None,
