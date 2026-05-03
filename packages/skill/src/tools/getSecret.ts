@@ -31,15 +31,13 @@ export function createGetSecretTool(client: RivaultClient): Tool {
         }
 
         const identity = await client.identityCached()
-        if (identity) {
-          await emitRelease({
-            userId: identity.userId,
-            apiKeyId: identity.apiKeyId ?? '',
-            itemId,
-            tier: 'L1',
-            plaintext: result.value,
-          })
-        }
+        await emitRelease({
+          userId: identity.userId,
+          apiKeyId: identity.apiKeyId ?? '',
+          itemId,
+          tier: 'L1',
+          plaintext: result.value,
+        })
 
         return textResult(
           `vault:${result.label}=${result.value}\n` +

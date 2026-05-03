@@ -68,13 +68,18 @@ export class RivaultClient {
   getApiKey(): string { return this.apiKey }
   getBaseUrl(): string { return this.baseUrl }
 
-  /** Cached identity for daemon release events. Best-effort: any failure swallowed. */
-  async identityCached(): Promise<MeResponse | null> {
+  /**
+   * Cached identity for daemon release events. Best-effort: any failure
+   * (network error, /agent/me not deployed, expired key) yields a stub
+   * with empty userId so callers can still proceed. Scrubbing is the
+   * critical guarantee — it must not depend on the API server being
+   * reachable, which is why this never returns null.
+   */
+  async identityCached(): Promise<MeResponse> {
     if (!this.identity) {
       this.identity = this.me().catch(() => ({ userId: '', apiKeyId: null }) as MeResponse)
     }
-    const r = await this.identity
-    return r.userId ? r : null
+    return this.identity
   }
 
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {

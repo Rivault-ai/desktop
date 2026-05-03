@@ -35,8 +35,8 @@ export function createPollAuthTool(client: RivaultClient): Tool {
           case 'approved': {
             // If the poll response includes the value inline, use it directly.
             if (result.value) {
-              const identity = await client.identityCached()
-              if (identity && itemId) {
+              if (itemId) {
+                const identity = await client.identityCached()
                 await emitRelease({
                   userId: identity.userId,
                   apiKeyId: identity.apiKeyId ?? '',

@@ -47,15 +47,13 @@ export function createPollHybridTool(client: RivaultClient): Tool {
               const identity = await client.identityCached()
               for (const [itemId, value] of Object.entries(result.authorizedValues)) {
                 parts.push(`  vault:auth:${itemId}=${value}`)
-                if (identity) {
-                  await emitRelease({
-                    userId: identity.userId,
-                    apiKeyId: identity.apiKeyId ?? '',
-                    itemId,
-                    tier: 'L2',
-                    plaintext: value,
-                  })
-                }
+                await emitRelease({
+                  userId: identity.userId,
+                  apiKeyId: identity.apiKeyId ?? '',
+                  itemId,
+                  tier: 'L2',
+                  plaintext: value,
+                })
               }
             }
 
