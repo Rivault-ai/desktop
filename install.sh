@@ -36,10 +36,12 @@ require() {
 
 ACTION="install"
 VERSION="latest"
+PURGE=0
 
 for arg in "$@"; do
     case "$arg" in
         --uninstall)     ACTION="uninstall" ;;
+        --purge)         PURGE=1 ;;
         --version=*)     VERSION="${arg#--version=}" ;;
         -h|--help)
             sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
@@ -65,9 +67,20 @@ if [ "$ACTION" = "uninstall" ]; then
     bold "Uninstalling Rivault..."
     osascript -e 'quit app "Rivault"' >/dev/null 2>&1 || true
     [ -d "$APP_DIR" ] && rm -rf "$APP_DIR" && green "  removed $APP_DIR"
-    [ -d "$SKILL_DIR" ] && rm -rf "$SKILL_DIR" && green "  removed $SKILL_DIR"
     [ -f "$CONFIG_FILE" ] && rm -f "$CONFIG_FILE" && green "  removed $CONFIG_FILE"
-    warn "  preserved $SUPPORT_DIR (contains your local ledger). Delete manually if you want a clean slate."
+    # The OpenClaw skill and the local ledger are preserved on purpose:
+    #   - SKILL.md lives at $SKILL_DIR and stays valid even if the daemon
+    #     is gone — OpenClaw can keep using Rivault via the public API.
+    #   - The ledger at $SUPPORT_DIR holds release audit history the user
+    #     may want to keep across reinstalls.
+    # Pass --purge to nuke both.
+    if [ "$PURGE" = "1" ]; then
+        [ -d "$SKILL_DIR" ] && rm -rf "$SKILL_DIR" && green "  removed $SKILL_DIR"
+        [ -d "$SUPPORT_DIR" ] && rm -rf "$SUPPORT_DIR" && green "  removed $SUPPORT_DIR"
+    else
+        warn "  preserved $SKILL_DIR (OpenClaw skill — still works without the desktop daemon)"
+        warn "  preserved $SUPPORT_DIR (local ledger). Run again with --purge to delete both."
+    fi
     green "Done."
     exit 0
 fi
