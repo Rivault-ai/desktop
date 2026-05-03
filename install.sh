@@ -62,7 +62,7 @@ require ditto
 # ---------- uninstall ----------
 
 if [ "$ACTION" = "uninstall" ]; then
-    bold "Uninstalling Rivault…"
+    bold "Uninstalling Rivault..."
     osascript -e 'quit app "Rivault"' >/dev/null 2>&1 || true
     [ -d "$APP_DIR" ] && rm -rf "$APP_DIR" && green "  removed $APP_DIR"
     [ -d "$SKILL_DIR" ] && rm -rf "$SKILL_DIR" && green "  removed $SKILL_DIR"
@@ -80,7 +80,7 @@ echo "  version: $VERSION"
 echo "  arch:    $(uname -m)"
 echo
 
-# Resolve "latest" → actual tag via the GitHub API.
+# Resolve "latest" -> actual tag via the GitHub API.
 if [ "$VERSION" = "latest" ]; then
     VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
         | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
@@ -94,13 +94,13 @@ SUMS_URL="https://github.com/${REPO}/releases/download/${VERSION}/checksums.txt"
 TMPDIR_=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_"' EXIT
 
-echo "  Downloading $VERSION…"
+echo "  Downloading $VERSION..."
 curl -fsSL --progress-bar -o "$TMPDIR_/Rivault-darwin.zip" "$ASSET_URL" \
     || die "Download failed: $ASSET_URL"
 curl -fsSL -o "$TMPDIR_/checksums.txt" "$SUMS_URL" \
     || die "Could not fetch checksums: $SUMS_URL"
 
-echo "  Verifying checksum…"
+echo "  Verifying checksum..."
 EXPECTED=$(awk '/Rivault-darwin\.zip$/ {print $1}' "$TMPDIR_/checksums.txt")
 ACTUAL=$(shasum -a 256 "$TMPDIR_/Rivault-darwin.zip" | awk '{print $1}')
 if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
@@ -108,12 +108,12 @@ if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
 fi
 green "  ok ($ACTUAL)"
 
-echo "  Extracting…"
+echo "  Extracting..."
 ditto -x -k "$TMPDIR_/Rivault-darwin.zip" "$TMPDIR_/extract"
 [ -d "$TMPDIR_/extract/Rivault.app" ] || die "Archive missing Rivault.app"
 [ -d "$TMPDIR_/extract/skill" ] || die "Archive missing skill/"
 
-echo "  Installing $APP_DIR…"
+echo "  Installing $APP_DIR..."
 osascript -e 'quit app "Rivault"' >/dev/null 2>&1 || true
 [ -d "$APP_DIR" ] && rm -rf "$APP_DIR"
 ditto "$TMPDIR_/extract/Rivault.app" "$APP_DIR"
@@ -121,7 +121,7 @@ ditto "$TMPDIR_/extract/Rivault.app" "$APP_DIR"
 # "developer cannot be verified" sheet on first launch.
 xattr -dr com.apple.quarantine "$APP_DIR" 2>/dev/null || true
 
-echo "  Installing skill → $SKILL_DIR"
+echo "  Installing skill -> $SKILL_DIR"
 mkdir -p "$(dirname "$SKILL_DIR")"
 [ -d "$SKILL_DIR" ] && rm -rf "$SKILL_DIR"
 ditto "$TMPDIR_/extract/skill" "$SKILL_DIR"
@@ -129,9 +129,9 @@ ditto "$TMPDIR_/extract/skill" "$SKILL_DIR"
 mkdir -p "$SUPPORT_DIR"
 
 echo
-bold "Almost done — set your API key."
-echo "Get one from https://rivault.ai (Settings → API keys)."
-printf "Paste your API key (rv_live_…) and press Enter, or leave blank to skip: "
+bold "Almost done -- set your API key."
+echo "Get one from https://rivault.ai (Settings -> API keys)."
+printf "Paste your API key (rv_live_...) and press Enter, or leave blank to skip: "
 # /dev/tty is necessary because stdin is the curl pipe
 if [ -t 0 ]; then
     IFS= read -r API_KEY
@@ -151,11 +151,11 @@ EOF
     chmod 600 "$CONFIG_FILE"
     green "  wrote $CONFIG_FILE (mode 600)"
 else
-    warn "  skipped — set the key later via the desktop app's Settings tab."
+    warn "  skipped -- set the key later via the desktop app's Settings tab."
 fi
 
 echo
-bold "Installed. Launching Rivault…"
+bold "Installed. Launching Rivault..."
 open -a Rivault || warn "Could not auto-launch. Run: open -a Rivault"
 echo
 echo "Tools:"
