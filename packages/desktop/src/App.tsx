@@ -70,21 +70,27 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
-      try {
-        const [s, r, c] = await Promise.all([
-          invoke<DaemonStatus>("daemon_status"),
-          invoke<LedgerEntry[]>("list_releases", { limit: 100 }),
-          invoke<ConfigStatus>("get_config_status"),
-        ]);
-        if (!cancelled) {
-          setStatus(s);
-          setReleases(r);
-          setConfig(c);
-          setError(null);
-        }
-      } catch (e) {
-        if (!cancelled) setError(String(e));
-      }
+      // Each invoke is allowed to fail independently — a corrupt config
+      // shouldn't blank the whole window when the daemon itself is fine.
+      const [s, r, c] = await Promise.all([
+        invoke<DaemonStatus>("daemon_status").catch(() => null),
+        invoke<LedgerEntry[]>("list_releases", { limit: 100 }).catch(
+          () => [] as LedgerEntry[],
+        ),
+        invoke<ConfigStatus>("get_config_status").catch(
+          () => ({
+            configured: false,
+            user_id: null,
+            api_key_masked: null,
+            base_url: null,
+          }) as ConfigStatus,
+        ),
+      ]);
+      if (cancelled) return;
+      if (s) setStatus(s);
+      setReleases(r);
+      setConfig(c);
+      setError(null);
     };
     tick();
     const id = window.setInterval(tick, 2000);
@@ -94,8 +100,7 @@ export default function App() {
     };
   }, []);
 
-  // Wait for first config probe before rendering — avoids flashing the
-  // dashboard for a beat before flipping to the setup screen.
+  // Brief boot flash while the very first probe is in flight.
   if (config === null) {
     return <div className="app boot" />;
   }

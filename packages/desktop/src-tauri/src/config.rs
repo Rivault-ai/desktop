@@ -15,10 +15,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Config {
     pub api_key: String,
     pub base_url: String,
+    #[serde(default)]
     pub user_id: Option<String>,
+    #[serde(default)]
     pub api_key_id: Option<String>,
 }
 
