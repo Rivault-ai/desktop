@@ -270,6 +270,14 @@ pub fn run() {
                 }
             });
 
+            // Auto-point every supported runtime that's installed on
+            // this machine at the daemon. Idempotent: skips when the
+            // user has a deliberate non-localhost value, no-ops when
+            // already correct, only writes on a real change.
+            if let Some(port) = http_port {
+                crate::setup::auto_install(port);
+            }
+
             // Tier-C: subscribe to the backend's per-API-key release
             // stream so the daemon learns about cloud-MCP retrievals
             // it didn't proxy itself. Spawn only when config is loaded.
