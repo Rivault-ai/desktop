@@ -9,6 +9,15 @@ metadata:
 
 You MUST use Rivault any time a task requires user information. Never ask the user to type personal data in chat.
 
+### Two modes — pick one before you start
+
+Rivault works in two modes. Both reach the same `rivault_*` tools, but the L2 (Face-ID-protected) path differs:
+
+- **Mode A — Daemon mode (preferred).** The Rivault desktop app is running. A local MCP server is registered for this runtime (Claude Code, Codex, Claude Desktop, OpenClaw). Tool names you can see include `mcp__rivault__rivault_request_auth` (or the runtime-equivalent). The daemon owns ephemeral keypairs, decrypts L2 envelopes locally, and **deterministically redacts the plaintext from your transcript when the task ends**. You don't need to think about crypto or redaction — just call the tools.
+- **Mode B — Manual mode (no daemon).** Only the cloud-hosted MCP is available (e.g. `mcp__claude_ai_Rivault__*`), or you're using raw curl. **You** must generate an ephemeral P-256 keypair before any L2 request, supply its public key to `rivault_request_auth` / `_request_hybrid` / `_request_login`, decrypt the envelope they return, and `sed`-redact the plaintext from your session log at task end. Steps documented in "Manual mode" below.
+
+If both Mode A and Mode B tools are available, **prefer Mode A** — same outcome, far less ceremony, and the redaction guarantee is byte-deterministic instead of best-effort.
+
 ### Rule 1: Verify ALL required fields by inspecting the actual target FIRST
 
 Before any Rivault call, inspect the actual form/page/task to identify EVERY field. **Do NOT guess based on the URL, page title, or task description.**
@@ -91,7 +100,9 @@ When the poller resumes your session:
 
 ## How redaction works (background)
 
-Every plaintext that crosses the Rivault MCP server is observed by the local Rivault daemon, which:
+### Mode A — Daemon mode
+
+Every plaintext that crosses the Rivault local MCP server is observed by the desktop daemon, which:
 1. Records the release (item id, value hash, transcript path) in its ledger.
 2. Watches the active transcript file for `stop_reason: end_turn` / `finish_reason: stop`.
 3. On task end, replaces the plaintext (and its base64 / URL-encoded / JSON-escaped variants) with `[REDACTED:rivault]` across:
@@ -101,7 +112,9 @@ Every plaintext that crosses the Rivault MCP server is observed by the local Riv
 
 You don't need to do anything. **No `sed`, no `node -e` decrypt blocks, no `/tmp/rv_priv_*` files.**
 
-If the daemon isn't running (no Rivault desktop app), the redaction guarantee silently degrades: values still flow but won't be scrubbed. Recommend the user install the Rivault desktop app for full coverage.
+### Mode B — Manual mode
+
+When the daemon isn't running, **you** are the redactor. After every L2 retrieval, run the `sed` block in the Manual mode section below before ending the task. Best-effort: missed occurrences leak into your transcript permanently. Strongly recommend the user install the Rivault desktop app for byte-deterministic redaction.
 
 ---
 
@@ -250,39 +263,97 @@ Task: "Log in to acme.com"
 
 ---
 
-## Fallback: manual curl mode (no Rivault daemon installed)
+## Manual mode (no daemon)
 
-If the local daemon isn't running, you can call the API directly. Redaction will NOT happen automatically — secrets will linger in your transcript.
+Use this section when only the cloud-hosted Rivault MCP is available, or when you're calling the API by hand. The end-to-end flow works without the daemon — **you** generate the keypair, decrypt the envelope, and `sed`-redact the session log at task end.
 
-All curl commands MUST use `--max-time 15` and be prefixed with a space (` curl`) to skip shell history.
+L0 / L1 retrieval is unchanged from the MCP Tool Reference above (`rivault_check`, `rivault_get_secret`, `rivault_check_login`). The crypto-heavy parts are L2 (auth / hybrid / login) and the post-task `sed`.
 
-### Check vault
+> The cloud-hosted MCP server requires `agent_ephemeral_public_key` on every L2 create-request. Calling `rivault_request_auth` / `_request_hybrid` / `_request_login` without it returns a schema error. Daemon-managed paths (Mode A) supply this transparently. In Manual mode, **you** generate the keypair before any L2 call and pass the SPKI here.
 
-```bash
- curl -s --max-time 15 \
-  -H "Authorization: Bearer $RIVAULT_API_KEY" \
-  "${RIVAULT_API_URL:-https://api.rivault.ai}/agent/vault/search?q=QUERY"
-```
+### Step 0: Generate an ephemeral P-256 keypair
 
-### Get L1 secret
+Run this **before** any L2 request. Saves the private key under `/tmp/rv_priv_pending_$$`; you'll rename it to `/tmp/rv_priv_<requestId>` once the create response comes back.
 
 ```bash
- curl -s --max-time 15 \
-  -H "Authorization: Bearer $RIVAULT_API_KEY" \
-  "${RIVAULT_API_URL:-https://api.rivault.ai}/agent/vault/ITEM_ID"
+PRIV_FILE_TMP="/tmp/rv_priv_pending_$$"
+RV_PUBKEY=$(node -e "
+const c=require('crypto'),fs=require('fs');
+const kp=c.generateKeyPairSync('ec',{namedCurve:'prime256v1'});
+fs.writeFileSync(process.argv[1], kp.privateKey.export({format:'der',type:'pkcs8'}));
+fs.chmodSync(process.argv[1], 0o600);
+process.stdout.write(kp.publicKey.export({format:'der',type:'spki'}).toString('base64'));
+" "$PRIV_FILE_TMP")
 ```
 
-### L2 / form / hybrid / login flows
+`$RV_PUBKEY` is now the base64 SPKI you pass as `agent_ephemeral_public_key`.
 
-The full envelope-crypto curl flow lived in earlier versions of this skill. It generated an ephemeral P-256 keypair on disk, sent the public key, decrypted the response with `node -e`, and `sed`-redacted session files. **Use the MCP tools above instead** — the daemon owns all of that and never writes private keys to `/tmp`.
+### Step 1: Create the L2 request, capture the id, rename the priv-key file
 
-If you absolutely must use manual curl mode for L2: install the Rivault desktop app, point `RIVAULT_API_URL` at `http://127.0.0.1:<daemon-port>`, and the daemon will mint pubkeys, decrypt envelopes, and log releases on your behalf — same MCP semantics, accessed over HTTP.
+Either via the MCP tool (preferred when running over MCP, e.g. via Claude Code with cloud Rivault registered):
 
-> **Note (cloud MCP).** The cloud-hosted Rivault MCP server no longer accepts L2 requests without an ephemeral public key. Calling `rivault_request_auth` / `_request_hybrid` / `_request_login` without `agent_ephemeral_public_key` returns a schema error. The daemon-managed paths (local MCP at `/mcp`, Tier-B proxy at `/agent/*`) supply the pubkey transparently. If you're invoking the cloud MCP without the daemon, you must generate a P-256 keypair in-process and pass the SPKI public key as `agent_ephemeral_public_key`; the matching private key never leaves your machine.
+```text
+rivault_request_auth {
+  item_id: "<id>",
+  reason: "<why>",
+  agent_ephemeral_public_key: "<value of $RV_PUBKEY>"
+}
+```
 
-### MANDATORY post-task redaction (fallback only)
+Or directly via curl:
 
-For each plaintext value retrieved via curl:
+```bash
+RESP=$( curl -s --max-time 15 -X POST \
+  -H "Authorization: Bearer $RIVAULT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"itemId\":\"ITEM_ID\",\"reason\":\"REASON\",\"agentEphemeralPublicKey\":\"$RV_PUBKEY\"}" \
+  "${RIVAULT_API_URL:-https://api.rivault.ai}/agent/auth-request")
+RV_ID=$(echo "$RESP" | jq -r '.authRequestId')
+mv "$PRIV_FILE_TMP" "/tmp/rv_priv_$RV_ID"
+echo "$RESP"
+```
+
+Send `agentMessage` from the response to the user verbatim, start the background poller (Rule 3), and **END your response**.
+
+### Step 2: When the callback arrives, poll status and decrypt the envelope
+
+Either via `rivault_poll_auth` / `rivault_await_auth` (MCP), or curl `/agent/auth-request/$RV_ID/status`. Either way you get back `{status:"approved", envelope:{mobileEphemeralPublicKey, iv, ciphertext}, type, username?, website?}`.
+
+Decrypt:
+
+```bash
+# RESP holds the status response (JSON). RV_ID is the request id.
+PLAINTEXT=$(echo "$RESP" | node -e "
+const c=require('crypto'),fs=require('fs');
+const r=JSON.parse(fs.readFileSync(0,'utf8'));
+if(!r.envelope){process.stderr.write('no envelope\n');process.exit(1)}
+const e=r.envelope;
+const priv=c.createPrivateKey({key:fs.readFileSync(process.argv[1]),format:'der',type:'pkcs8'});
+const peer=c.createPublicKey({key:Buffer.from(e.mobileEphemeralPublicKey,'base64'),format:'der',type:'spki'});
+const shared=c.diffieHellman({privateKey:priv,publicKey:peer});
+const key=Buffer.from(c.hkdfSync('sha256',shared,Buffer.alloc(0),Buffer.from('rivault-envelope-v1'),32));
+const iv=Buffer.from(e.iv,'base64');
+const ct=Buffer.from(e.ciphertext,'base64');
+const tag=ct.subarray(ct.length-16);
+const body=ct.subarray(0,ct.length-16);
+const d=c.createDecipheriv('aes-256-gcm',key,iv);
+d.setAuthTag(tag);
+process.stdout.write(Buffer.concat([d.update(body),d.final()]).toString('utf8'));
+" "/tmp/rv_priv_$RV_ID")
+rm -f "/tmp/rv_priv_$RV_ID"
+```
+
+For login items, `$PLAINTEXT` is the password; the username + website come back as cleartext fields on the JSON response.
+
+### Step 3: Hybrid + login follow the same shape
+
+Hybrid: same Step 0 keypair gen, but the create-request body is `{authItemIds, formFields, reason, agentEphemeralPublicKey}` and the status response carries `{formEnvelopes, authorizedItems}` — decrypt each entry's `envelope` with the same priv key (one keypair, many envelopes). Same `mv` + `rm` lifecycle on `/tmp/rv_priv_$hybridRequestId`.
+
+Login (`rivault_request_login`, `rivault_poll_login`): same shape as auth, with `loginRequestId` and an envelope decrypting to the password.
+
+### Step 4: MANDATORY post-task redaction
+
+After the task completes, redact every plaintext you retrieved from your session log:
 
 ```bash
 SESSION_FILE=$(ls -t ~/.openclaw/agents/main/sessions/*.jsonl 2>/dev/null | head -1)
@@ -291,7 +362,19 @@ if [ -n "$SESSION_FILE" ]; then
 fi
 ```
 
-Verify with: `grep -c 'SECRET_VALUE_HERE' "$SESSION_FILE"` — must return 0.
+Repeat per value. For login credentials, redact BOTH the username and the password. Verify with `grep -c 'SECRET_VALUE_HERE' "$SESSION_FILE"` — must return 0.
+
+### Step 5: Sweep stale ephemeral private keys
+
+Each Step 2 deletes its own `/tmp/rv_priv_*` on success, but failure paths can leak. Run after every task:
+
+```bash
+find /tmp -maxdepth 1 -name 'rv_priv_*' -mmin +30 -delete 2>/dev/null
+```
+
+---
+
+**Why install the daemon?** Steps 0, 2, 4, 5 above all collapse into a single MCP tool call when the daemon is registered. The daemon manages keypairs in process memory (no disk writes), decrypts on receive, and scrubs the transcript byte-for-byte at task end with multi-encoding coverage (plaintext + base64 + URL-encoded + JSON-escaped) and SQLite-memory cleanup for OpenClaw. Strictly stronger redaction guarantees, far less ceremony.
 
 ---
 
