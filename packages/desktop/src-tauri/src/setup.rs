@@ -50,6 +50,82 @@ pub fn mcp_url(http_port: u16) -> String {
     format!("http://127.0.0.1:{http_port}/mcp")
 }
 
+/// Decide whether a per-runtime install should write, skip, or no-op.
+///
+/// Defends against three failure modes:
+/// - **Clobbering a deliberate user override.** If the existing value
+///   points at something other than localhost (staging proxy, corp
+///   gateway, alternate port outside our range), don't touch it.
+/// - **Wasted writes.** If the value already matches what we'd write,
+///   don't re-open the file. Removes write-race surface and keeps the
+///   audit trail clean.
+/// - **Stale localhost values.** If the value is a 127.0.0.1 URL on a
+///   different port (we picked a different port last run), overwrite.
+fn decide(current: Option<&str>, target: &str) -> InstallDecision {
+    match current {
+        None => InstallDecision::Write,
+        Some(s) if s == target => InstallDecision::NoOp,
+        Some(s) if is_local_url(s) => InstallDecision::Write,
+        Some(s) => InstallDecision::Skip(s.to_string()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InstallDecision {
+    /// Field absent or pointing at a stale localhost URL (different port).
+    Write,
+    /// Field already matches the target — don't open the file for write.
+    NoOp,
+    /// Field is a non-local URL the user set deliberately. Carries the
+    /// existing value for logging.
+    Skip(String),
+}
+
+fn is_local_url(s: &str) -> bool {
+    s.starts_with("http://127.0.0.1")
+        || s.starts_with("http://localhost")
+        || s.starts_with("https://127.0.0.1")
+        || s.starts_with("https://localhost")
+}
+
+fn log_skip(runtime: &str, existing: &str) {
+    tracing::info!(
+        runtime,
+        existing,
+        "skipping mcp install: user has a non-localhost value configured; \
+         delete it manually if you want the daemon to manage this runtime",
+    );
+}
+
+/// Auto-install on every supported runtime whose config file exists.
+///
+/// Called by the daemon at startup once the HTTP port is bound.
+/// Idempotent: each per-runtime `install()` short-circuits to NoOp if
+/// the entry already points at the right URL, and Skip if the user has
+/// a non-localhost value.
+pub fn auto_install(http_port: u16) {
+    if claude_code::config_exists() {
+        if let Err(e) = claude_code::install(http_port) {
+            tracing::warn!("claude_code auto-install: {e:#}");
+        }
+    }
+    if claude_desktop::config_exists() {
+        if let Err(e) = claude_desktop::install(http_port) {
+            tracing::warn!("claude_desktop auto-install: {e:#}");
+        }
+    }
+    if codex::config_exists() {
+        if let Err(e) = codex::install(http_port) {
+            tracing::warn!("codex auto-install: {e:#}");
+        }
+    }
+    if openclaw::config_exists() {
+        if let Err(e) = openclaw::install(http_port) {
+            tracing::warn!("openclaw auto-install: {e:#}");
+        }
+    }
+}
+
 // ---- Claude Code ----------------------------------------------------------
 pub mod claude_code {
     use super::*;
@@ -57,6 +133,10 @@ pub mod claude_code {
 
     fn config_path() -> Result<PathBuf> {
         Ok(home()?.join(".claude.json"))
+    }
+
+    pub fn config_exists() -> bool {
+        config_path().map(|p| p.exists()).unwrap_or(false)
     }
 
     pub fn probe() -> Result<bool> {
@@ -71,12 +151,30 @@ pub mod claude_code {
 
     pub fn install(http_port: u16) -> Result<()> {
         let p = config_path()?;
-        let mut root: Value = if p.exists() {
-            let text = fs::read_to_string(&p)?;
-            serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+        let target = super::mcp_url(http_port);
+        let root_text = if p.exists() {
+            fs::read_to_string(&p)?
         } else {
-            json!({})
+            String::new()
         };
+        let mut root: Value = if root_text.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&root_text).unwrap_or_else(|_| json!({}))
+        };
+
+        let current = root
+            .pointer(&format!("/mcpServers/{ENTRY_NAME}/url"))
+            .and_then(|v| v.as_str());
+        match decide(current, &target) {
+            InstallDecision::NoOp => return Ok(()),
+            InstallDecision::Skip(existing) => {
+                log_skip("claude_code", &existing);
+                return Ok(());
+            }
+            InstallDecision::Write => {}
+        }
+
         let servers = root
             .as_object_mut()
             .ok_or_else(|| anyhow!("~/.claude.json is not a JSON object"))?
@@ -89,7 +187,7 @@ pub mod claude_code {
             ENTRY_NAME.to_string(),
             json!({
                 "type": "http",
-                "url": super::mcp_url(http_port),
+                "url": target,
             }),
         );
         atomic_write_json(&p, &root)
@@ -128,6 +226,10 @@ pub mod claude_desktop {
             .join("claude_desktop_config.json"))
     }
 
+    pub fn config_exists() -> bool {
+        config_path().map(|p| p.exists()).unwrap_or(false)
+    }
+
     pub fn probe() -> Result<bool> {
         let p = config_path()?;
         if !p.exists() {
@@ -143,12 +245,26 @@ pub mod claude_desktop {
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).ok();
         }
+        let target = super::mcp_url(http_port);
         let mut root: Value = if p.exists() {
             let text = fs::read_to_string(&p)?;
             serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
         } else {
             json!({})
         };
+
+        let current = root
+            .pointer(&format!("/mcpServers/{ENTRY_NAME}/url"))
+            .and_then(|v| v.as_str());
+        match decide(current, &target) {
+            InstallDecision::NoOp => return Ok(()),
+            InstallDecision::Skip(existing) => {
+                log_skip("claude_desktop", &existing);
+                return Ok(());
+            }
+            InstallDecision::Write => {}
+        }
+
         let servers = root
             .as_object_mut()
             .ok_or_else(|| anyhow!("claude_desktop_config.json is not a JSON object"))?
@@ -165,7 +281,7 @@ pub mod claude_desktop {
         map.insert(
             ENTRY_NAME.to_string(),
             json!({
-                "url": super::mcp_url(http_port),
+                "url": target,
             }),
         );
         atomic_write_json(&p, &root)
@@ -197,6 +313,10 @@ pub mod codex {
         Ok(home()?.join(".codex").join("config.toml"))
     }
 
+    pub fn config_exists() -> bool {
+        config_path().map(|p| p.exists()).unwrap_or(false)
+    }
+
     /// Marker line bracketing our config block so we can find + remove it
     /// without bringing in a TOML parser. The config file may contain
     /// hand-edited content; surgical block-edits keep the user's
@@ -212,13 +332,36 @@ pub mod codex {
         Ok(fs::read_to_string(&p)?.contains(BEGIN))
     }
 
+    /// Detect a hand-authored `[mcp_servers.rivault]` table outside our
+    /// managed block. If present, the user owns this entry — leave it
+    /// alone so we don't create duplicate TOML keys.
+    fn has_unmanaged_entry(existing: &str) -> bool {
+        // Strip the managed block first, then scan the rest.
+        let stripped = match existing
+            .find(BEGIN)
+            .and_then(|s| existing[s..].find(END).map(|e| (s, s + e + END.len())))
+        {
+            Some((s, e)) => {
+                let mut out = String::with_capacity(existing.len());
+                out.push_str(&existing[..s]);
+                out.push_str(&existing[e..]);
+                out
+            }
+            None => existing.to_string(),
+        };
+        // Match `[mcp_servers.rivault]` anchored to the start of a line.
+        stripped
+            .lines()
+            .any(|line| line.trim_start() == "[mcp_servers.rivault]")
+    }
+
     pub fn install(http_port: u16) -> Result<()> {
         let p = config_path()?;
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).ok();
         }
         let url = super::mcp_url(http_port);
-        let block = format!(
+        let target_block = format!(
             "{BEGIN}\n[mcp_servers.{ENTRY_NAME}]\nurl = \"{url}\"\n{END}\n",
         );
         let existing = if p.exists() {
@@ -226,6 +369,24 @@ pub mod codex {
         } else {
             String::new()
         };
+
+        if has_unmanaged_entry(&existing) {
+            log_skip("codex", "[mcp_servers.rivault] (hand-authored)");
+            return Ok(());
+        }
+
+        // If the managed block is already exactly what we'd write, no-op.
+        let trimmed_target = target_block.trim_end();
+        if let Some(start) = existing.find(BEGIN) {
+            if let Some(end_rel) = existing[start..].find(END) {
+                let end = start + end_rel + END.len();
+                let current_block = &existing[start..end];
+                if current_block == trimmed_target {
+                    return Ok(());
+                }
+            }
+        }
+
         let new = match existing
             .find(BEGIN)
             .and_then(|s| existing[s..].find(END).map(|e| (s, s + e + END.len())))
@@ -235,7 +396,7 @@ pub mod codex {
                 // surrounding hand-edits).
                 let mut out = String::with_capacity(existing.len());
                 out.push_str(&existing[..s]);
-                out.push_str(block.trim_end());
+                out.push_str(trimmed_target);
                 out.push_str(&existing[e..]);
                 out
             }
@@ -248,7 +409,7 @@ pub mod codex {
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                out.push_str(&block);
+                out.push_str(&target_block);
                 out
             }
         };
@@ -290,15 +451,21 @@ pub mod openclaw {
         Ok(home()?.join(".openclaw").join("openclaw.json"))
     }
 
-    /// We don't add a separate "MCP" entry for OpenClaw — its existing
-    /// Rivault skill plugin already calls into the upstream client via
-    /// `RIVAULT_API_URL`. Pointing that env at the daemon's HTTP listener
-    /// (where the proxy lives in Tier B; once the local MCP is the
-    /// preferred path, OpenClaw will use the same `/mcp` endpoint) is
-    /// the install gesture.
+    pub fn config_exists() -> bool {
+        config_path().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// OpenClaw's per-skill plugin config lives at
+    /// `skills.entries.<name>.{apiKey,apiUrl,...}` and is passed to the
+    /// plugin as `pluginConfig` at registration time. Our skill
+    /// (`packages/skill/src/index.ts::register`) reads `apiUrl` from
+    /// there. Setting `apiUrl` to the daemon's localhost listener is
+    /// what makes OpenClaw route through the daemon (Tier-B proxy on
+    /// `/agent/*` for now; same listener also serves `/mcp` once we
+    /// switch the plugin to the MCP-tool surface).
     ///
-    /// Probe returns `true` when the env override is configured in
-    /// `openclaw.json` and points at 127.0.0.1.
+    /// Probe returns `true` when `skills.entries.rivault.apiUrl`
+    /// points at 127.0.0.1.
     pub fn probe() -> Result<bool> {
         let p = config_path()?;
         if !p.exists() {
@@ -306,8 +473,10 @@ pub mod openclaw {
         }
         let text = fs::read_to_string(&p)?;
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let env = v.pointer("/env/RIVAULT_API_URL").and_then(|v| v.as_str());
-        Ok(env.map_or(false, |s| s.contains("127.0.0.1")))
+        let url = v
+            .pointer("/skills/entries/rivault/apiUrl")
+            .and_then(|v| v.as_str());
+        Ok(url.map_or(false, |s| s.contains("127.0.0.1")))
     }
 
     pub fn install(http_port: u16) -> Result<()> {
@@ -315,24 +484,43 @@ pub mod openclaw {
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).ok();
         }
+        let target = format!("http://127.0.0.1:{http_port}");
         let mut root: Value = if p.exists() {
             let text = fs::read_to_string(&p)?;
             serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
         } else {
             json!({})
         };
-        let env = root
+
+        let current = root
+            .pointer("/skills/entries/rivault/apiUrl")
+            .and_then(|v| v.as_str());
+        match decide(current, &target) {
+            InstallDecision::NoOp => return Ok(()),
+            InstallDecision::Skip(existing) => {
+                log_skip("openclaw", &existing);
+                return Ok(());
+            }
+            InstallDecision::Write => {}
+        }
+
+        let entry = root
             .as_object_mut()
             .ok_or_else(|| anyhow!("openclaw.json is not a JSON object"))?
-            .entry("env")
-            .or_insert_with(|| json!({}));
-        let env_map = env
+            .entry("skills")
+            .or_insert_with(|| json!({}))
             .as_object_mut()
-            .ok_or_else(|| anyhow!("openclaw.json `env` is not an object"))?;
-        env_map.insert(
-            "RIVAULT_API_URL".to_string(),
-            json!(format!("http://127.0.0.1:{http_port}")),
-        );
+            .ok_or_else(|| anyhow!("openclaw.json `skills` is not an object"))?
+            .entry("entries")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("openclaw.json `skills.entries` is not an object"))?
+            .entry("rivault")
+            .or_insert_with(|| json!({}));
+        let entry_map = entry.as_object_mut().ok_or_else(|| {
+            anyhow!("openclaw.json `skills.entries.rivault` is not an object")
+        })?;
+        entry_map.insert("apiUrl".to_string(), json!(target));
         atomic_write_json(&p, &root)
     }
 
@@ -343,12 +531,16 @@ pub mod openclaw {
         }
         let text = fs::read_to_string(&p)?;
         let mut root: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        if let Some(env_map) = root
+        if let Some(entry) = root
             .as_object_mut()
-            .and_then(|o| o.get_mut("env"))
+            .and_then(|o| o.get_mut("skills"))
+            .and_then(|s| s.as_object_mut())
+            .and_then(|s| s.get_mut("entries"))
             .and_then(|e| e.as_object_mut())
+            .and_then(|e| e.get_mut("rivault"))
+            .and_then(|r| r.as_object_mut())
         {
-            env_map.remove("RIVAULT_API_URL");
+            entry.remove("apiUrl");
         }
         atomic_write_json(&p, &root)
     }
@@ -469,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn openclaw_install_sets_env_var() {
+    fn openclaw_install_sets_skill_apiurl() {
         let home = fresh_home();
         with_home(home.path(), || {
             openclaw::install(47318).unwrap();
@@ -477,12 +669,131 @@ mod tests {
             let v: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
             assert_eq!(
-                v["env"]["RIVAULT_API_URL"],
+                v["skills"]["entries"]["rivault"]["apiUrl"],
                 serde_json::Value::String("http://127.0.0.1:47318".into())
             );
             assert!(openclaw::probe().unwrap());
             openclaw::uninstall().unwrap();
             assert!(!openclaw::probe().unwrap());
+        });
+    }
+
+    #[test]
+    fn install_skips_when_user_has_non_local_url() {
+        let home = fresh_home();
+        with_home(home.path(), || {
+            // User points Claude Code at a corporate proxy.
+            let p = home.path().join(".claude.json");
+            fs::write(
+                &p,
+                r#"{"mcpServers":{"rivault":{"type":"http","url":"https://rivault.corp.example.com/mcp"}}}"#,
+            )
+            .unwrap();
+            // Auto-install must NOT clobber it.
+            claude_code::install(47318).unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+            assert_eq!(
+                v["mcpServers"]["rivault"]["url"],
+                "https://rivault.corp.example.com/mcp"
+            );
+        });
+    }
+
+    #[test]
+    fn install_overwrites_stale_localhost_port() {
+        let home = fresh_home();
+        with_home(home.path(), || {
+            // Previous run picked a different port; new run uses 47320.
+            let p = home.path().join(".claude.json");
+            fs::write(
+                &p,
+                r#"{"mcpServers":{"rivault":{"type":"http","url":"http://127.0.0.1:47318/mcp"}}}"#,
+            )
+            .unwrap();
+            claude_code::install(47320).unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+            assert_eq!(
+                v["mcpServers"]["rivault"]["url"],
+                "http://127.0.0.1:47320/mcp"
+            );
+        });
+    }
+
+    #[test]
+    fn install_is_no_op_when_already_correct() {
+        let home = fresh_home();
+        with_home(home.path(), || {
+            let p = home.path().join(".claude.json");
+            // Pre-existing file, exactly the URL we'd write.
+            fs::write(
+                &p,
+                r#"{"mcpServers":{"rivault":{"type":"http","url":"http://127.0.0.1:47318/mcp"}}}"#,
+            )
+            .unwrap();
+            let mtime_before = fs::metadata(&p).unwrap().modified().unwrap();
+            // Sleep enough that any rewrite would land at a later mtime.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            claude_code::install(47318).unwrap();
+            let mtime_after = fs::metadata(&p).unwrap().modified().unwrap();
+            // No-op path must not touch the file at all.
+            assert_eq!(
+                mtime_before, mtime_after,
+                "no-op install must not rewrite the config file"
+            );
+        });
+    }
+
+    #[test]
+    fn codex_install_skips_when_user_authored_unmanaged_block() {
+        let home = fresh_home();
+        with_home(home.path(), || {
+            let p = home.path().join(".codex").join("config.toml");
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            // User wrote their own [mcp_servers.rivault] table by hand.
+            fs::write(
+                &p,
+                "model = \"o4-mini\"\n\n[mcp_servers.rivault]\nurl = \"https://rivault.corp.example.com/mcp\"\n",
+            )
+            .unwrap();
+            codex::install(47318).unwrap();
+            let after = fs::read_to_string(&p).unwrap();
+            // Original entry intact; no managed block appended.
+            assert!(after.contains("rivault.corp.example.com"));
+            assert!(!after.contains("# >>> rivault (managed) >>>"));
+            assert!(!after.contains("127.0.0.1"));
+        });
+    }
+
+    #[test]
+    fn openclaw_install_preserves_existing_skill_config() {
+        let home = fresh_home();
+        with_home(home.path(), || {
+            // Mimic real openclaw.json: skills.entries.rivault.apiKey set
+            // by user wizard; install must not blow that away.
+            let p = home.path().join(".openclaw").join("openclaw.json");
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(
+                &p,
+                r#"{"skills":{"entries":{"rivault":{"enabled":true,"apiKey":"rv_live_xxx"}}}}"#,
+            )
+            .unwrap();
+            openclaw::install(47318).unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+            let entry = &v["skills"]["entries"]["rivault"];
+            assert_eq!(entry["apiKey"], "rv_live_xxx");
+            assert_eq!(entry["enabled"], true);
+            assert_eq!(entry["apiUrl"], "http://127.0.0.1:47318");
+            // Uninstall strips only apiUrl.
+            openclaw::uninstall().unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+            let entry = &v["skills"]["entries"]["rivault"];
+            assert_eq!(entry["apiKey"], "rv_live_xxx");
+            assert_eq!(entry["enabled"], true);
+            assert!(entry.get("apiUrl").is_none());
         });
     }
 }

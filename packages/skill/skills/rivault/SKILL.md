@@ -278,6 +278,8 @@ The full envelope-crypto curl flow lived in earlier versions of this skill. It g
 
 If you absolutely must use manual curl mode for L2: install the Rivault desktop app, point `RIVAULT_API_URL` at `http://127.0.0.1:<daemon-port>`, and the daemon will mint pubkeys, decrypt envelopes, and log releases on your behalf — same MCP semantics, accessed over HTTP.
 
+> **Note (cloud MCP).** The cloud-hosted Rivault MCP server no longer accepts L2 requests without an ephemeral public key. Calling `rivault_request_auth` / `_request_hybrid` / `_request_login` without `agent_ephemeral_public_key` returns a schema error. The daemon-managed paths (local MCP at `/mcp`, Tier-B proxy at `/agent/*`) supply the pubkey transparently. If you're invoking the cloud MCP without the daemon, you must generate a P-256 keypair in-process and pass the SPKI public key as `agent_ephemeral_public_key`; the matching private key never leaves your machine.
+
 ### MANDATORY post-task redaction (fallback only)
 
 For each plaintext value retrieved via curl:

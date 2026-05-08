@@ -68,6 +68,52 @@ if [ "$ACTION" = "uninstall" ]; then
     osascript -e 'quit app "Rivault"' >/dev/null 2>&1 || true
     [ -d "$APP_DIR" ] && rm -rf "$APP_DIR" && green "  removed $APP_DIR"
     [ -f "$CONFIG_FILE" ] && rm -f "$CONFIG_FILE" && green "  removed $CONFIG_FILE"
+
+    # Strip per-runtime localhost overrides so the agents don't keep
+    # routing to a dead daemon. Only touches the field if it points at
+    # 127.0.0.1 — leaves user-authored non-local values alone.
+    if command -v python3 >/dev/null 2>&1; then
+        for f in \
+            "${HOME}/.claude.json:mcpServers.rivault.url" \
+            "${HOME}/Library/Application Support/Claude/claude_desktop_config.json:mcpServers.rivault.url" \
+            "${HOME}/.openclaw/openclaw.json:skills.entries.rivault.apiUrl"
+        do
+            file="${f%%:*}"
+            path="${f##*:}"
+            [ -f "$file" ] || continue
+            python3 - "$file" "$path" <<'PY' && green "  cleared local-mcp override in ${file#${HOME}/}"
+import json, sys
+file_path, dotted = sys.argv[1], sys.argv[2]
+with open(file_path) as fh:
+    data = json.load(fh)
+keys = dotted.split(".")
+node = data
+for k in keys[:-1]:
+    if not isinstance(node, dict) or k not in node:
+        sys.exit(1)
+    node = node[k]
+if not isinstance(node, dict):
+    sys.exit(1)
+val = node.get(keys[-1], "")
+if isinstance(val, str) and ("127.0.0.1" in val or "://localhost" in val):
+    del node[keys[-1]]
+    with open(file_path, "w") as fh:
+        json.dump(data, fh, indent=2)
+    sys.exit(0)
+sys.exit(1)
+PY
+        done
+        # Codex config is TOML — strip just our marker block.
+        codex_cfg="${HOME}/.codex/config.toml"
+        if [ -f "$codex_cfg" ] && grep -q "# >>> rivault (managed) >>>" "$codex_cfg"; then
+            tmp=$(mktemp)
+            awk 'BEGIN{skip=0} /^# >>> rivault \(managed\) >>>/{skip=1; next} /^# <<< rivault \(managed\) <<</{skip=0; next} !skip{print}' "$codex_cfg" > "$tmp" \
+                && mv "$tmp" "$codex_cfg" \
+                && green "  cleared local-mcp override in ${codex_cfg#${HOME}/}"
+        fi
+    else
+        warn "  python3 not found — skipping per-runtime config cleanup"
+    fi
     # The OpenClaw skill and the local ledger are preserved on purpose:
     #   - SKILL.md lives at $SKILL_DIR and stays valid even if the daemon
     #     is gone — OpenClaw can keep using Rivault via the public API.
