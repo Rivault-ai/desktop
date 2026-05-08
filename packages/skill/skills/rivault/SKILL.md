@@ -96,6 +96,40 @@ When the poller resumes your session:
 **`[RIVAULT_DENIED]`** — user denied access:
 - Tell the user you cannot proceed without this data.
 
+### Rule 5: ALWAYS redact retrieved values from your session log at task end
+
+This rule applies to **every** retrieved value, **every** mode (L1, L2, daemon installed or not):
+
+- L1 retrieved via `rivault_get_secret` (cloud MCP returns plaintext directly).
+- L2 retrieved via `rivault_poll_auth` / `_poll_hybrid` / `_poll_login`.
+- Any value obtained through the manual-curl fallback below.
+
+For each retrieved value, run before ending the task:
+
+```bash
+SESSION_FILE=$(ls -t ~/.openclaw/agents/main/sessions/*.jsonl 2>/dev/null | head -1)
+if [ -n "$SESSION_FILE" ]; then
+  sed -i '' 's/SECRET_VALUE_HERE/[REDACTED]/g' "$SESSION_FILE"
+fi
+```
+
+Replace `SECRET_VALUE_HERE` with each actual plaintext value. Run once per value. For login credentials, redact **both** the username and the password.
+
+Verify with `grep -c 'SECRET_VALUE_HERE' "$SESSION_FILE"` — must return 0.
+
+**With the Rivault desktop daemon installed, this is redundant** — the daemon scrubs the same bytes (and the base64 / URL-encoded / JSON-escaped variants you might have missed) at task end. Running `sed` anyway is a cheap belt-and-braces and costs nothing.
+
+**Without the daemon, this is your only line of defense.** Skipping it leaves plaintext in your session log permanently. The user will not thank you.
+
+### Absolute rules
+
+- Never ask users to type secrets in chat.
+- Never echo, repeat, or display secret values in your messages.
+- ALL vault values — L1 and L2 alike — must NEVER be written to persistent storage (files, memory, session history, logs) beyond the in-memory single-operation use.
+- After the operation, do not reference or summarise the secret value back to the user.
+- If a secret was written to any file by accident, replace it with `[REDACTED]` immediately (per Rule 5).
+- Always pass the `reason` argument so the user understands why each item is being requested.
+
 ---
 
 ## How redaction works (background)
