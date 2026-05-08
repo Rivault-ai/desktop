@@ -443,9 +443,24 @@ pub mod codex {
 }
 
 // ---- OpenClaw -------------------------------------------------------------
+//
+// OpenClaw is unusual among the supported runtimes in that its config
+// schema rejects unknown keys. Earlier iterations of this module wrote
+// `skills.entries.rivault.apiUrl` to point the plugin at the daemon —
+// the user's `openclaw doctor` correctly flagged it as an invalid key
+// and refused to start the gateway.
+//
+// The skill auto-discovers the daemon now: the desktop daemon's
+// discovery file at `~/Library/Application Support/Rivault/daemon.json`
+// is read by `packages/skill/src/lib/discovery.ts` and used as the
+// preferred API base URL when present. So OpenClaw needs *no* config
+// edit to route through the daemon — the install() function below is
+// reduced to a cleanup-only operation that strips the now-invalid
+// `apiUrl` key from rows that an older daemon binary may have written.
+
 pub mod openclaw {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::Value;
 
     fn config_path() -> Result<PathBuf> {
         Ok(home()?.join(".openclaw").join("openclaw.json"))
@@ -455,17 +470,9 @@ pub mod openclaw {
         config_path().map(|p| p.exists()).unwrap_or(false)
     }
 
-    /// OpenClaw's per-skill plugin config lives at
-    /// `skills.entries.<name>.{apiKey,apiUrl,...}` and is passed to the
-    /// plugin as `pluginConfig` at registration time. Our skill
-    /// (`packages/skill/src/index.ts::register`) reads `apiUrl` from
-    /// there. Setting `apiUrl` to the daemon's localhost listener is
-    /// what makes OpenClaw route through the daemon (Tier-B proxy on
-    /// `/agent/*` for now; same listener also serves `/mcp` once we
-    /// switch the plugin to the MCP-tool surface).
-    ///
-    /// Probe returns `true` when `skills.entries.rivault.apiUrl`
-    /// points at 127.0.0.1.
+    /// Probe returns `true` once the cleanup is settled — there is no
+    /// `apiUrl` left in `skills.entries.rivault`. The daemon no longer
+    /// writes this key; auto-discovery handles routing.
     pub fn probe() -> Result<bool> {
         let p = config_path()?;
         if !p.exists() {
@@ -473,55 +480,20 @@ pub mod openclaw {
         }
         let text = fs::read_to_string(&p)?;
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let url = v
+        let has_legacy_apiurl = v
             .pointer("/skills/entries/rivault/apiUrl")
-            .and_then(|v| v.as_str());
-        Ok(url.map_or(false, |s| s.contains("127.0.0.1")))
+            .is_some();
+        Ok(!has_legacy_apiurl)
     }
 
-    pub fn install(http_port: u16) -> Result<()> {
-        let p = config_path()?;
-        if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        let target = format!("http://127.0.0.1:{http_port}");
-        let mut root: Value = if p.exists() {
-            let text = fs::read_to_string(&p)?;
-            serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
-        } else {
-            json!({})
-        };
-
-        let current = root
-            .pointer("/skills/entries/rivault/apiUrl")
-            .and_then(|v| v.as_str());
-        match decide(current, &target) {
-            InstallDecision::NoOp => return Ok(()),
-            InstallDecision::Skip(existing) => {
-                log_skip("openclaw", &existing);
-                return Ok(());
-            }
-            InstallDecision::Write => {}
-        }
-
-        let entry = root
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("openclaw.json is not a JSON object"))?
-            .entry("skills")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("openclaw.json `skills` is not an object"))?
-            .entry("entries")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("openclaw.json `skills.entries` is not an object"))?
-            .entry("rivault")
-            .or_insert_with(|| json!({}));
-        let entry_map = entry.as_object_mut().ok_or_else(|| {
-            anyhow!("openclaw.json `skills.entries.rivault` is not an object")
-        })?;
-        entry_map.insert("apiUrl".to_string(), json!(target));
-        atomic_write_json(&p, &root)
+    /// Cleanup-only: strip a legacy `apiUrl` key under
+    /// `skills.entries.rivault` if present. No-ops if the key isn't
+    /// there or the file doesn't exist.
+    ///
+    /// Signature still takes `http_port` for API symmetry with the
+    /// other runtimes' `install(port)` calls — the value is unused.
+    pub fn install(_http_port: u16) -> Result<()> {
+        uninstall()
     }
 
     pub fn uninstall() -> Result<()> {
@@ -531,7 +503,7 @@ pub mod openclaw {
         }
         let text = fs::read_to_string(&p)?;
         let mut root: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        if let Some(entry) = root
+        let removed = root
             .as_object_mut()
             .and_then(|o| o.get_mut("skills"))
             .and_then(|s| s.as_object_mut())
@@ -539,10 +511,16 @@ pub mod openclaw {
             .and_then(|e| e.as_object_mut())
             .and_then(|e| e.get_mut("rivault"))
             .and_then(|r| r.as_object_mut())
-        {
-            entry.remove("apiUrl");
+            .and_then(|entry| entry.remove("apiUrl"))
+            .is_some();
+        if removed {
+            atomic_write_json(&p, &root)?;
+            tracing::info!(
+                "openclaw: stripped legacy `skills.entries.rivault.apiUrl` \
+                 (skill now auto-discovers the daemon via discovery file)"
+            );
         }
-        atomic_write_json(&p, &root)
+        Ok(())
     }
 }
 
@@ -661,20 +639,61 @@ mod tests {
     }
 
     #[test]
-    fn openclaw_install_sets_skill_apiurl() {
+    fn openclaw_install_strips_legacy_apiurl_in_place() {
+        let home = fresh_home();
+        with_home(home.path(), || {
+            // Pre-condition: a previous daemon binary wrote `apiUrl` here,
+            // and OpenClaw rejects it as an unknown key.
+            let p = home.path().join(".openclaw").join("openclaw.json");
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(
+                &p,
+                r#"{"skills":{"entries":{"rivault":{"enabled":true,"apiKey":"rv_live_xxx","apiUrl":"http://127.0.0.1:47318"}}}}"#,
+            )
+            .unwrap();
+            assert!(!openclaw::probe().unwrap(), "legacy apiUrl present pre-cleanup");
+
+            openclaw::install(47318).unwrap();
+
+            let v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+            let entry = &v["skills"]["entries"]["rivault"];
+            assert_eq!(entry["apiKey"], "rv_live_xxx");
+            assert_eq!(entry["enabled"], true);
+            assert!(entry.get("apiUrl").is_none(), "apiUrl must be stripped");
+            assert!(openclaw::probe().unwrap(), "post-cleanup probe true");
+        });
+    }
+
+    #[test]
+    fn openclaw_install_no_op_when_clean() {
+        let home = fresh_home();
+        with_home(home.path(), || {
+            let p = home.path().join(".openclaw").join("openclaw.json");
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(
+                &p,
+                r#"{"skills":{"entries":{"rivault":{"enabled":true,"apiKey":"rv_live_xxx"}}}}"#,
+            )
+            .unwrap();
+            let mtime_before = fs::metadata(&p).unwrap().modified().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            openclaw::install(47318).unwrap();
+            let mtime_after = fs::metadata(&p).unwrap().modified().unwrap();
+            assert_eq!(
+                mtime_before, mtime_after,
+                "no-op cleanup must not rewrite the config"
+            );
+        });
+    }
+
+    #[test]
+    fn openclaw_install_no_op_when_file_absent() {
         let home = fresh_home();
         with_home(home.path(), || {
             openclaw::install(47318).unwrap();
             let p = home.path().join(".openclaw").join("openclaw.json");
-            let v: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
-            assert_eq!(
-                v["skills"]["entries"]["rivault"]["apiUrl"],
-                serde_json::Value::String("http://127.0.0.1:47318".into())
-            );
-            assert!(openclaw::probe().unwrap());
-            openclaw::uninstall().unwrap();
-            assert!(!openclaw::probe().unwrap());
+            assert!(!p.exists(), "install must not create openclaw.json");
         });
     }
 
@@ -767,27 +786,21 @@ mod tests {
     }
 
     #[test]
-    fn openclaw_install_preserves_existing_skill_config() {
+    fn openclaw_install_preserves_other_skill_fields() {
         let home = fresh_home();
         with_home(home.path(), || {
             // Mimic real openclaw.json: skills.entries.rivault.apiKey set
-            // by user wizard; install must not blow that away.
+            // by user wizard, plus a stale apiUrl from an older daemon.
+            // Cleanup must remove ONLY apiUrl, leaving every other field
+            // byte-identical.
             let p = home.path().join(".openclaw").join("openclaw.json");
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(
                 &p,
-                r#"{"skills":{"entries":{"rivault":{"enabled":true,"apiKey":"rv_live_xxx"}}}}"#,
+                r#"{"skills":{"entries":{"rivault":{"enabled":true,"apiKey":"rv_live_xxx","apiUrl":"http://127.0.0.1:99999"}}}}"#,
             )
             .unwrap();
             openclaw::install(47318).unwrap();
-            let v: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
-            let entry = &v["skills"]["entries"]["rivault"];
-            assert_eq!(entry["apiKey"], "rv_live_xxx");
-            assert_eq!(entry["enabled"], true);
-            assert_eq!(entry["apiUrl"], "http://127.0.0.1:47318");
-            // Uninstall strips only apiUrl.
-            openclaw::uninstall().unwrap();
             let v: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
             let entry = &v["skills"]["entries"]["rivault"];
