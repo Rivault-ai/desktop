@@ -50,8 +50,14 @@ struct StreamEvent {
 /// backoff so transient backend hiccups don't drop coverage. The task
 /// only exits when the daemon process exits (no graceful cancellation
 /// path today; daemon shutdown is process-level, so the OS reclaims).
+///
+/// Uses `tauri::async_runtime::spawn` instead of bare `tokio::spawn`
+/// because this is invoked from Tauri's `setup` closure on the main
+/// thread, where there's no thread-local tokio runtime context. Tauri's
+/// async-runtime wrapper carries an explicit handle to the runtime it
+/// owns, so it works from anywhere.
 pub fn spawn(daemon: Arc<Daemon>, base_url: String, api_key: String, runtime: AgentRuntime) {
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let mut backoff = MIN_BACKOFF;
         loop {
             match run_once(&daemon, &base_url, &api_key, &runtime).await {
