@@ -9,14 +9,22 @@
 //!
 //! L1 detection is exact: `GET /agent/vault/{id}` with an L1 item
 //! returns `{value, label}` in the response body, so we can hash and
-//! ledger-insert before relaying. L2 envelope endpoints
-//! (`/agent/auth-request/*/status`, `/hybrid-request/*/status`,
-//! `/login-request/*/status`) return ciphertext only — the daemon can
-//! see "an L2 envelope was returned" but cannot decrypt without owning
-//! the agent's ephemeral keypair, which lives client-side in the
-//! curl-flavored flow today. For deterministic L2 redaction the user
-//! must use local MCP. The proxy still records L2 metadata so the UI
-//! can surface "L2 retrieved (not redactable from this path)".
+//! ledger-insert before relaying.
+//!
+//! L2 path is also handled transparently. When a `POST /agent/auth-request`
+//! or `/agent/hybrid-request` arrives without `agentEphemeralPublicKey`,
+//! the proxy mints an ephemeral keypair (using the upstream `KeypairStore`),
+//! injects the public SPKI into the request body, forwards upstream, and
+//! stashes the private key under the upstream-issued request id. On the
+//! matching `/status` poll, if an envelope is present, the proxy decrypts
+//! locally, rewrites the response to put plaintext in `value` /
+//! `formValues` / `authorizedValues`, and inserts a ledger row. Same
+//! redaction guarantees as the local MCP path — the OpenClaw plugin
+//! gets L2 plaintext back exactly as `pollAuth` / `pollHybrid` expect,
+//! and the daemon owns the entire crypto lifecycle.
+//!
+//! Callers that already supply their own pubkey are passed through
+//! unchanged and decrypt themselves (the curl-flavoured manual mode).
 //!
 //! Auth: pass-through. The agent already owns the API key — we just
 //! forward `Authorization: Bearer …` headers verbatim. The proxy never
@@ -27,10 +35,11 @@ use axum::body::{to_bytes, Body};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::Router;
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -38,6 +47,8 @@ use crate::daemon::release::{AgentRuntime, ReleaseEvent, Tier};
 use crate::daemon::Daemon;
 use crate::ledger::Channel;
 use crate::mcp::transcript::resolve_transcript_paths;
+use crate::upstream::envelope::{decrypt_with, Envelope, Keypair};
+use crate::upstream::keypair_store::KeypairStore;
 
 /// Default backend the proxy forwards to. Override via the `RivaultProxy`
 /// constructor for tests / staging environments.
@@ -58,6 +69,10 @@ pub struct ProxyState {
     runtime: AgentRuntime,
     backend: Arc<str>,
     http: Client,
+    /// Stores ephemeral private keys minted on L2 create-request paths,
+    /// keyed by the upstream-issued request id. Decrypts on the matching
+    /// `/status` poll, then drops the keypair (one-shot).
+    keypairs: KeypairStore,
 }
 
 impl ProxyState {
@@ -78,6 +93,7 @@ impl ProxyState {
             runtime,
             backend: backend.into(),
             http,
+            keypairs: KeypairStore::new(),
         })
     }
 }
@@ -91,12 +107,23 @@ pub fn router(state: ProxyState) -> Router {
         // Specific paths first so they win when the wildcard would also match.
         .route("/agent/vault/search", get(forward_passthrough))
         .route("/agent/vault/logins", get(forward_passthrough))
-        // L1 retrieval — the only path where plaintext lands in the
-        // response body, so the only path with bespoke ledger logic.
+        // L1 retrieval — plaintext lands in the response body.
         .route("/agent/vault/:item_id", get(forward_l1_retrieve))
-        // Catch-all for everything else under /agent/*. Includes the
-        // envelope-mode L2 endpoints (auth-request, hybrid-request,
-        // login-request) plus their /status counterparts.
+        // L2 auth flow: daemon mints keypair on create, decrypts on poll.
+        .route("/agent/auth-request", post(forward_request_auth))
+        .route(
+            "/agent/auth-request/:auth_request_id/status",
+            get(forward_auth_status),
+        )
+        // L2 hybrid flow: same shape, but the status response carries
+        // multiple envelopes (formEnvelopes + authorizedItems).
+        .route("/agent/hybrid-request", post(forward_request_hybrid))
+        .route(
+            "/agent/hybrid-request/:hybrid_request_id/status",
+            get(forward_hybrid_status),
+        )
+        // Catch-all for everything else under /agent/* (form-request,
+        // login-request, anything new the backend ships).
         .route("/agent/*rest", any(forward_passthrough))
         .with_state(s)
 }
@@ -315,15 +342,353 @@ fn log_release(
         .map(|_| ())
 }
 
-/// Record an L2-envelope-delivery observation. Today this is a no-op
-/// beyond a log line — the daemon doesn't have plaintext, so there's
-/// nothing it can scrub. The eventual UI will surface this as
-/// "L2 retrieved via curl flow — install local MCP to redact".
+/// Record an L2-envelope-delivery observation on paths the proxy
+/// can't decrypt (e.g. login-request before that flow's L2-decrypt
+/// handler is wired). The dedicated `forward_auth_status` /
+/// `forward_hybrid_status` handlers below DO decrypt and ledger-log.
 fn log_l2_observation(_state: &ProxyState) {
     tracing::info!(
-        "proxy observed L2 envelope delivery — no plaintext available; \
-         install local MCP for deterministic L2 redaction"
+        "proxy observed L2 envelope delivery on a path without bespoke \
+         decryption — install local MCP for deterministic L2 redaction"
     );
+}
+
+// ---- L2: auth-request ----------------------------------------------------
+
+/// `POST /agent/auth-request` — mint an ephemeral keypair if the caller
+/// didn't supply one, inject the public SPKI into the request body, and
+/// stash the private key under the upstream-issued `authRequestId`.
+async fn forward_request_auth(
+    State(s): State<Arc<ProxyState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> impl IntoResponse {
+    forward_l2_create(&s, &method, &uri, &headers, body, "authRequestId").await
+}
+
+/// `GET /agent/auth-request/:id/status` — forward, then if the response
+/// carries an envelope and we minted a keypair earlier, decrypt locally
+/// and rewrite the body so the agent gets `value` (matching the skill's
+/// `pollAuth` typing). Inserts a ledger row on the rewritten plaintext.
+async fn forward_auth_status(
+    State(s): State<Arc<ProxyState>>,
+    AxumPath(auth_request_id): AxumPath<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> impl IntoResponse {
+    let url = build_upstream_url(&s.backend, uri.path(), uri.query());
+    let res = match relay(&s.http, &method, &url, &headers, body).await {
+        Ok(r) => r,
+        Err(e) => return upstream_error(e),
+    };
+    let status = res.status();
+    let response_headers = res.headers().clone();
+    let bytes = match res.bytes().await {
+        Ok(b) => b.to_vec(),
+        Err(e) => return upstream_error(anyhow::anyhow!("read body: {e}")),
+    };
+
+    let final_bytes = if status.is_success() && bytes.len() <= MAX_INSPECT_BYTES {
+        match transform_auth_status(&s, &auth_request_id, &bytes) {
+            Some(rewritten) => rewritten,
+            None => bytes,
+        }
+    } else {
+        bytes
+    };
+
+    build_axum_response(
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
+        response_headers,
+        final_bytes,
+    )
+}
+
+// ---- L2: hybrid-request --------------------------------------------------
+
+async fn forward_request_hybrid(
+    State(s): State<Arc<ProxyState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> impl IntoResponse {
+    forward_l2_create(&s, &method, &uri, &headers, body, "hybridRequestId").await
+}
+
+async fn forward_hybrid_status(
+    State(s): State<Arc<ProxyState>>,
+    AxumPath(hybrid_request_id): AxumPath<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> impl IntoResponse {
+    let url = build_upstream_url(&s.backend, uri.path(), uri.query());
+    let res = match relay(&s.http, &method, &url, &headers, body).await {
+        Ok(r) => r,
+        Err(e) => return upstream_error(e),
+    };
+    let status = res.status();
+    let response_headers = res.headers().clone();
+    let bytes = match res.bytes().await {
+        Ok(b) => b.to_vec(),
+        Err(e) => return upstream_error(anyhow::anyhow!("read body: {e}")),
+    };
+
+    let final_bytes = if status.is_success() && bytes.len() <= MAX_INSPECT_BYTES {
+        match transform_hybrid_status(&s, &hybrid_request_id, &bytes) {
+            Some(rewritten) => rewritten,
+            None => bytes,
+        }
+    } else {
+        bytes
+    };
+
+    build_axum_response(
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
+        response_headers,
+        final_bytes,
+    )
+}
+
+// ---- shared L2 helpers ---------------------------------------------------
+
+/// Common path for L2 create requests. Reads the body, injects a
+/// daemon-minted `agentEphemeralPublicKey` if absent, forwards upstream,
+/// and on success stashes the keypair under the response's `id_field`
+/// (`authRequestId` / `hybridRequestId`).
+async fn forward_l2_create(
+    s: &Arc<ProxyState>,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Body,
+    id_field: &str,
+) -> axum::response::Response {
+    let body_bytes = to_bytes(body, MAX_INSPECT_BYTES * 2)
+        .await
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+
+    // Parse JSON, mint+inject if needed.
+    let (final_body, our_keypair) = match maybe_inject_pubkey(&body_bytes) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!("proxy L2 create: body inject failed: {e:#}; forwarding as-is");
+            (body_bytes, None)
+        }
+    };
+
+    let url = build_upstream_url(&s.backend, uri.path(), uri.query());
+    let res = match relay_bytes(&s.http, method, &url, headers, final_body).await {
+        Ok(r) => r,
+        Err(e) => return upstream_error(e),
+    };
+    let status = res.status();
+    let response_headers = res.headers().clone();
+    let response_bytes = match res.bytes().await {
+        Ok(b) => b.to_vec(),
+        Err(e) => return upstream_error(anyhow::anyhow!("read body: {e}")),
+    };
+
+    // Stash keypair under upstream-issued request id, only on success.
+    if status.is_success() {
+        if let Some(kp) = our_keypair {
+            if let Some(request_id) = extract_string_field(&response_bytes, id_field) {
+                s.keypairs.store(&request_id, kp);
+            } else {
+                tracing::warn!(
+                    "proxy L2 create: upstream response missing `{id_field}`; \
+                     keypair dropped (status will fail to decrypt)"
+                );
+            }
+        }
+    }
+
+    build_axum_response(
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
+        response_headers,
+        response_bytes,
+    )
+}
+
+/// Inspect the request body. If `agentEphemeralPublicKey` is missing,
+/// mint a fresh keypair, inject the SPKI base64, and return the rewritten
+/// body bytes plus the keypair (so the caller can stash it once the
+/// upstream returns the request id).
+fn maybe_inject_pubkey(body_bytes: &[u8]) -> Result<(Vec<u8>, Option<Keypair>)> {
+    if body_bytes.is_empty() {
+        return Ok((body_bytes.to_vec(), None));
+    }
+    let mut v: Value = match serde_json::from_slice(body_bytes) {
+        Ok(v) => v,
+        Err(_) => return Ok((body_bytes.to_vec(), None)), // leave non-JSON alone
+    };
+    if v.get("agentEphemeralPublicKey")
+        .and_then(|x| x.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        // Caller already supplied their own pubkey; pass through and let
+        // them decrypt locally. We don't even buffer their keypair.
+        return Ok((body_bytes.to_vec(), None));
+    }
+    let kp = Keypair::generate()?;
+    let pub_b64 = kp.public_spki_b64();
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "agentEphemeralPublicKey".to_string(),
+            Value::String(pub_b64),
+        );
+    }
+    Ok((serde_json::to_vec(&v)?, Some(kp)))
+}
+
+/// Look up the value of a top-level string field in a JSON body. Used
+/// to extract the upstream-issued `authRequestId` / `hybridRequestId`.
+fn extract_string_field(bytes: &[u8], field: &str) -> Option<String> {
+    let v: Value = serde_json::from_slice(bytes).ok()?;
+    v.get(field)?.as_str().map(|s| s.to_string())
+}
+
+/// Decrypt the auth-status response and rewrite to put plaintext on
+/// `value`. Returns None if the response isn't approved-with-envelope
+/// or we don't have a stored keypair (caller supplied their own).
+fn transform_auth_status(s: &ProxyState, auth_request_id: &str, body: &[u8]) -> Option<Vec<u8>> {
+    let mut v: Value = serde_json::from_slice(body).ok()?;
+    if v.get("status")?.as_str()? != "approved" {
+        return None;
+    }
+    let envelope_value = v.get("envelope").cloned()?;
+    let envelope: Envelope = serde_json::from_value(envelope_value).ok()?;
+    let kp = s.keypairs.take(auth_request_id)?;
+    let plaintext_bytes = decrypt_with(kp.secret(), &envelope).ok()?;
+    drop(kp);
+    let plaintext = String::from_utf8_lossy(&plaintext_bytes).into_owned();
+
+    if let Err(e) = log_release(s, Tier::L2, &plaintext, auth_request_id) {
+        tracing::warn!(
+            auth_request_id = %auth_request_id,
+            "proxy auth_status: ledger insert failed: {e:#}"
+        );
+    }
+
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("envelope");
+        obj.insert("value".to_string(), Value::String(plaintext));
+    }
+    serde_json::to_vec(&v).ok()
+}
+
+/// Decrypt every envelope in a hybrid-status response and rewrite to
+/// the shape the OpenClaw skill's `pollHybrid` expects:
+/// `{ status, formValues, authorizedValues, createdItemIds }`.
+fn transform_hybrid_status(s: &ProxyState, hybrid_request_id: &str, body: &[u8]) -> Option<Vec<u8>> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    if v.get("status")?.as_str()? != "submitted" {
+        return None;
+    }
+    let kp = s.keypairs.take(hybrid_request_id)?;
+    let secret = kp.secret();
+
+    let mut form_values = serde_json::Map::new();
+    if let Some(form_envelopes) = v.get("formEnvelopes").and_then(|f| f.as_object()) {
+        for (key, env_value) in form_envelopes {
+            if let Ok(env) = serde_json::from_value::<Envelope>(env_value.clone()) {
+                if let Ok(pt) = decrypt_with(secret, &env) {
+                    let plaintext = String::from_utf8_lossy(&pt).into_owned();
+                    if let Err(e) = log_release(s, Tier::L2, &plaintext, hybrid_request_id) {
+                        tracing::warn!(
+                            hybrid_request_id = %hybrid_request_id,
+                            field = %key,
+                            "proxy hybrid_status: ledger insert (form) failed: {e:#}"
+                        );
+                    }
+                    form_values.insert(key.clone(), Value::String(plaintext));
+                }
+            }
+        }
+    }
+
+    let mut authorized_values = serde_json::Map::new();
+    if let Some(authorized) = v.get("authorizedItems").and_then(|a| a.as_object()) {
+        for (item_id, entry) in authorized {
+            let env_value = match entry.get("envelope") {
+                Some(e) => e.clone(),
+                None => continue,
+            };
+            let Ok(env) = serde_json::from_value::<Envelope>(env_value) else {
+                continue;
+            };
+            if let Ok(pt) = decrypt_with(secret, &env) {
+                let plaintext = String::from_utf8_lossy(&pt).into_owned();
+                if let Err(e) = log_release(s, Tier::L2, &plaintext, hybrid_request_id) {
+                    tracing::warn!(
+                        hybrid_request_id = %hybrid_request_id,
+                        item_id = %item_id,
+                        "proxy hybrid_status: ledger insert (auth) failed: {e:#}"
+                    );
+                }
+                authorized_values.insert(item_id.clone(), Value::String(plaintext));
+            }
+        }
+    }
+    drop(kp);
+
+    let created_item_ids = v
+        .get("createdItemIds")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+
+    let rewritten = json!({
+        "status": "submitted",
+        "formValues": form_values,
+        "authorizedValues": authorized_values,
+        "createdItemIds": created_item_ids,
+    });
+    serde_json::to_vec(&rewritten).ok()
+}
+
+/// Like `relay`, but the body is already buffered into bytes (we
+/// modified it for L2 pubkey injection).
+async fn relay_bytes(
+    http: &Client,
+    method: &Method,
+    url: &str,
+    headers: &HeaderMap,
+    body_bytes: Vec<u8>,
+) -> Result<reqwest::Response> {
+    let upstream_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .unwrap_or(reqwest::Method::POST);
+    let mut rb = http.request(upstream_method, url);
+    for (k, v) in headers.iter() {
+        let name = k.as_str();
+        if is_hop_by_hop(name) || name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        // Drop the Content-Length too — we may have changed the body
+        // size by injecting `agentEphemeralPublicKey`. reqwest sets a
+        // fresh one based on the buffer we hand it.
+        if name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        if let (Ok(hk), Ok(hv)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            rb = rb.header(hk, hv);
+        }
+    }
+    if !body_bytes.is_empty() {
+        rb = rb.body(body_bytes);
+    }
+    let res = rb.send().await?;
+    Ok(res)
 }
 
 #[cfg(test)]
@@ -384,5 +749,136 @@ mod tests {
         assert!(is_hop_by_hop("transfer-encoding"));
         assert!(!is_hop_by_hop("authorization"));
         assert!(!is_hop_by_hop("content-type"));
+    }
+
+    #[test]
+    fn maybe_inject_pubkey_adds_when_absent() {
+        let body = br#"{"itemId":"abc","reason":"test"}"#;
+        let (out, kp) = maybe_inject_pubkey(body).unwrap();
+        assert!(kp.is_some(), "should mint a keypair when absent");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let pk = parsed["agentEphemeralPublicKey"].as_str().unwrap();
+        assert!(pk.len() > 80, "pubkey base64 should be sizeable");
+        assert_eq!(parsed["itemId"], "abc");
+        assert_eq!(parsed["reason"], "test");
+    }
+
+    #[test]
+    fn maybe_inject_pubkey_passes_through_when_present() {
+        let body =
+            br#"{"itemId":"abc","reason":"test","agentEphemeralPublicKey":"USER_SPKI"}"#;
+        let (out, kp) = maybe_inject_pubkey(body).unwrap();
+        assert!(kp.is_none(), "caller-supplied pubkey -> no mint");
+        // Body byte-equal to input (no rewrite).
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn maybe_inject_pubkey_passes_through_on_garbage() {
+        let body = b"not json";
+        let (out, kp) = maybe_inject_pubkey(body).unwrap();
+        assert!(kp.is_none());
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn extract_string_field_pulls_request_id() {
+        let body = br#"{"authRequestId":"areq_xyz","authUrl":"u","expiresAt":"x"}"#;
+        assert_eq!(
+            extract_string_field(body, "authRequestId").as_deref(),
+            Some("areq_xyz")
+        );
+        assert_eq!(extract_string_field(body, "missing"), None);
+    }
+
+    #[tokio::test]
+    async fn transform_auth_status_decrypts_and_rewrites() {
+        use crate::upstream::envelope::Keypair;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+        // Set up a state with a known stored keypair.
+        let daemon = Arc::new(crate::daemon::Daemon::new(
+            crate::ledger::Ledger::open_in_memory().unwrap(),
+        ));
+        let state = ProxyState::with_backend(
+            daemon,
+            AgentRuntime::Openclaw,
+            "https://example.invalid",
+        )
+        .unwrap();
+        let kp = Keypair::generate().unwrap();
+        let pub_b64 = kp.public_spki_b64();
+        state.keypairs.store("areq_xyz", kp);
+
+        // Build an envelope addressed to that keypair (mirror the
+        // backend's encryption flow inline).
+        use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng as AeadOsRng, Payload};
+        use aes_gcm::Aes256Gcm;
+        use hkdf::Hkdf;
+        use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
+        use p256::{ecdh::diffie_hellman, PublicKey, SecretKey};
+        use rand::rngs::OsRng;
+        use sha2::Sha256;
+
+        let der = B64.decode(pub_b64.as_bytes()).unwrap();
+        let daemon_pub = PublicKey::from_public_key_der(&der).unwrap();
+        let peer = SecretKey::random(&mut OsRng);
+        let peer_pub_der = peer.public_key().to_public_key_der().unwrap().into_vec();
+        let shared = diffie_hellman(peer.to_nonzero_scalar(), daemon_pub.as_affine());
+        let hk = Hkdf::<Sha256>::new(None, shared.raw_secret_bytes());
+        let mut key = [0u8; 32];
+        hk.expand(b"rivault-envelope-v1", &mut key).unwrap();
+        let cipher = Aes256Gcm::new(&key.into());
+        let iv = Aes256Gcm::generate_nonce(&mut AeadOsRng);
+        let ct = cipher
+            .encrypt(
+                &iv,
+                Payload {
+                    msg: b"hunter2",
+                    aad: &[],
+                },
+            )
+            .unwrap();
+
+        let body = serde_json::json!({
+            "status": "approved",
+            "type": "general",
+            "envelope": {
+                "mobileEphemeralPublicKey": B64.encode(&peer_pub_der),
+                "iv": B64.encode(&iv),
+                "ciphertext": B64.encode(&ct),
+            }
+        })
+        .to_string();
+
+        let rewritten =
+            transform_auth_status(&state, "areq_xyz", body.as_bytes()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(parsed["status"], "approved");
+        assert_eq!(parsed["value"], "hunter2");
+        assert!(
+            parsed.get("envelope").is_none(),
+            "envelope must be replaced"
+        );
+        // Keypair should be consumed.
+        assert!(
+            transform_auth_status(&state, "areq_xyz", body.as_bytes()).is_none(),
+            "second call has no keypair → returns None"
+        );
+    }
+
+    #[test]
+    fn transform_auth_status_skips_pending() {
+        let daemon = Arc::new(crate::daemon::Daemon::new(
+            crate::ledger::Ledger::open_in_memory().unwrap(),
+        ));
+        let state = ProxyState::with_backend(
+            daemon,
+            AgentRuntime::Openclaw,
+            "https://example.invalid",
+        )
+        .unwrap();
+        let body = br#"{"status":"pending"}"#;
+        assert!(transform_auth_status(&state, "any", body).is_none());
     }
 }
