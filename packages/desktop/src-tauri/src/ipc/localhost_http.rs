@@ -12,12 +12,13 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use super::auth::verify;
 use super::IpcContext;
+use crate::daemon::orchestrator::StopScope;
 use crate::daemon::release::ReleaseEvent;
 use crate::ledger::Channel;
 
@@ -39,11 +40,32 @@ struct ErrBody {
     error: String,
 }
 
-pub async fn serve(ctx: IpcContext) -> Result<u16> {
-    let app = Router::new()
+#[derive(Debug, Deserialize)]
+struct StopBody {
+    #[serde(default)]
+    release_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StopOk {
+    /// Number of open releases that were signalled to scrub immediately.
+    /// Zero is a valid response — the matching releases may have already
+    /// been scrubbed by the watcher or hard cap.
+    fired: usize,
+}
+
+pub async fn serve(ctx: IpcContext, mcp_router: Option<Router>) -> Result<u16> {
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/release", post(release))
+        .route("/stop", post(stop))
         .with_state(Arc::new(ctx));
+
+    if let Some(mcp) = mcp_router {
+        app = app.merge(mcp);
+    }
 
     for port in PORT_RANGE {
         let addr = format!("127.0.0.1:{port}");
@@ -120,4 +142,58 @@ async fn release(
         )
             .into_response(),
     }
+}
+
+/// Force any matching open release(s) to scrub immediately.
+///
+/// Called by the local MCP server on agent disconnect, by the OpenClaw
+/// plugin's exit hook, and (optionally) by Claude Code's `Stop` hook.
+/// HMAC-only — the browser channel deliberately can't trigger scrubs,
+/// since the only legitimate caller is the local agent runtime, which
+/// already has access to `daemon.json` (mode 0600).
+async fn stop(
+    State(ctx): State<Arc<IpcContext>>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    let signature = headers
+        .get("x-rivault-signature")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    if signature.is_empty() || !verify(ctx.secret.as_slice(), body.as_bytes(), signature) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrBody {
+                error: "missing or invalid X-Rivault-Signature".into(),
+            }),
+        )
+            .into_response();
+    }
+    let req: StopBody = match serde_json::from_str(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrBody {
+                    error: format!("decode: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let scope = StopScope {
+        release_id: req.release_id,
+        session_id: req.session_id,
+    };
+    if scope.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrBody {
+                error: "must provide release_id or session_id".into(),
+            }),
+        )
+            .into_response();
+    }
+    let fired = ctx.daemon.trigger_stop(&scope);
+    (StatusCode::OK, Json(StopOk { fired })).into_response()
 }

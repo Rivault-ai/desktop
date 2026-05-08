@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS releases (
     plaintext_seen_locally  INTEGER NOT NULL,
     transcript_paths        TEXT NOT NULL,
     transcript_offsets      TEXT,
+    scrub_anchors           TEXT,
     released_at             TEXT NOT NULL,
     scrubbed_at             TEXT,
     rotated_at              TEXT,
@@ -37,8 +38,13 @@ CREATE INDEX IF NOT EXISTS idx_releases_open
 // Adds columns introduced after the v0 schema. ALTER TABLE ADD COLUMN is
 // idempotent here only because we wrap each in its own transaction and
 // silently ignore the duplicate-column error rusqlite raises on retry.
+//
+// `transcript_offsets` is kept (not dropped) so older rows remain readable;
+// `scrub_anchors` supersedes it for new inserts and carries both file-byte
+// offsets and SQLite rowid anchors.
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE releases ADD COLUMN transcript_offsets TEXT",
+    "ALTER TABLE releases ADD COLUMN scrub_anchors TEXT",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,18 +58,64 @@ pub struct LedgerEntry {
     pub channel: Channel,
     pub plaintext_seen_locally: bool,
     pub transcript_paths: Vec<String>,
-    /// File-size snapshot per `transcript_paths` at the moment the release
-    /// was accepted. Populated for runtimes that store transcripts in
-    /// append-only JSONL — used by the scrubber to confine redaction to
-    /// the task window so existing pre-release content stays untouched.
-    /// Empty / missing for older rows or runtimes we can't safely scope.
+    /// Snapshots taken at release time so the scrubber can confine its
+    /// edits to the task window and leave pre-release content
+    /// byte-identical. Carries file-byte offsets for append-only JSONL
+    /// transcripts and per-table `MAX(rowid)` for SQLite memory stores
+    /// (e.g. `~/.openclaw/memory/main.sqlite`). Empty / missing for older
+    /// rows or runtimes we can't safely scope.
     #[serde(default)]
-    pub transcript_offsets: HashMap<String, u64>,
+    pub scrub_anchors: ScrubAnchors,
     pub released_at: String,
     pub scrubbed_at: Option<String>,
     pub rotated_at: Option<String>,
     pub trigger_that_fired: Option<String>,
     pub scrub_verified: bool,
+}
+
+/// Task-window anchors persisted alongside each release.
+///
+/// Three flavors today:
+/// - `files`: per-path byte offset captured from `metadata.len()` at release
+///   time. Scrubbed bytes are confined to `[offset, EOF)` — used by the
+///   targeted Scope-1 scrubber.
+/// - `files_precount`: pre-existing occurrence count of the plaintext (and
+///   each encoded variant) in every sibling transcript file at release
+///   time. Used by the Scope-2 escalation scrubber to redact only the
+///   *new* occurrences in files we didn't snapshot byte-offsets for.
+///   Outer key: file path. Inner key: needle. Value: occurrence count
+///   pre-release.
+/// - `sqlite`: per-database `MAX(rowid)` snapshot per table (used by the
+///   OpenClaw memory scrubber). Rows where `rowid > snapshot` are
+///   in-window and may be scrubbed; older rows are left byte-identical.
+///
+/// Maps are keyed by absolute path so a single release can carry a mix
+/// (e.g. an OpenClaw release scopes the JSONL transcript, every sibling
+/// session file, and the memory DB).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScrubAnchors {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub files: HashMap<String, u64>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub files_precount: HashMap<String, HashMap<String, usize>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sqlite: HashMap<String, SqliteAnchor>,
+}
+
+impl ScrubAnchors {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.files_precount.is_empty() && self.sqlite.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SqliteAnchor {
+    /// Per-table `MAX(rowid)` at release time. `INTEGER PRIMARY KEY` columns
+    /// alias `rowid`, so this also covers tables with explicit primary keys.
+    pub max_rowids: HashMap<String, i64>,
+    /// WAL frame number at snapshot time; informational, not load-bearing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_frame: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,17 +174,21 @@ impl Ledger {
 
     pub fn insert(&self, entry: &LedgerEntry) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let offsets_json = if entry.transcript_offsets.is_empty() {
+        // New rows write `scrub_anchors` only. The old `transcript_offsets`
+        // column stays NULL on new inserts (it's preserved for read-back of
+        // historical rows; see `row_to_entry`).
+        let anchors_json = if entry.scrub_anchors.is_empty() {
             None
         } else {
-            Some(serde_json::to_string(&entry.transcript_offsets)?)
+            Some(serde_json::to_string(&entry.scrub_anchors)?)
         };
         conn.execute(
             "INSERT OR REPLACE INTO releases (
                 release_id, session_id, value_hash, tier, agent_runtime, mcp_mode,
                 channel, plaintext_seen_locally, transcript_paths, transcript_offsets,
-                released_at, scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                scrub_anchors, released_at, scrubbed_at, rotated_at, trigger_that_fired,
+                scrub_verified
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 entry.release_id,
                 entry.session_id,
@@ -147,7 +203,8 @@ impl Ledger {
                 entry.channel.as_str(),
                 entry.plaintext_seen_locally as i64,
                 serde_json::to_string(&entry.transcript_paths)?,
-                offsets_json,
+                Option::<String>::None,
+                anchors_json,
                 entry.released_at,
                 entry.scrubbed_at,
                 entry.rotated_at,
@@ -188,7 +245,8 @@ impl Ledger {
         conn.query_row(
             "SELECT release_id, session_id, value_hash, tier, agent_runtime, mcp_mode,
                     channel, plaintext_seen_locally, transcript_paths, transcript_offsets,
-                    released_at, scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
+                    scrub_anchors, released_at, scrubbed_at, rotated_at, trigger_that_fired,
+                    scrub_verified
              FROM releases WHERE release_id = ?",
             params![release_id],
             row_to_entry,
@@ -202,7 +260,8 @@ impl Ledger {
         let mut stmt = conn.prepare(
             "SELECT release_id, session_id, value_hash, tier, agent_runtime, mcp_mode,
                     channel, plaintext_seen_locally, transcript_paths, transcript_offsets,
-                    released_at, scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
+                    scrub_anchors, released_at, scrubbed_at, rotated_at, trigger_that_fired,
+                    scrub_verified
              FROM releases ORDER BY released_at DESC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![limit], row_to_entry)?;
@@ -218,7 +277,8 @@ impl Ledger {
         let mut stmt = conn.prepare(
             "SELECT release_id, session_id, value_hash, tier, agent_runtime, mcp_mode,
                     channel, plaintext_seen_locally, transcript_paths, transcript_offsets,
-                    released_at, scrubbed_at, rotated_at, trigger_that_fired, scrub_verified
+                    scrub_anchors, released_at, scrubbed_at, rotated_at, trigger_that_fired,
+                    scrub_verified
              FROM releases WHERE scrubbed_at IS NULL ORDER BY released_at ASC",
         )?;
         let rows = stmt.query_map([], row_to_entry)?;
@@ -236,7 +296,30 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<LedgerEntry> {
     let mcp_mode_s: Option<String> = row.get(5)?;
     let channel_s: String = row.get(6)?;
     let paths_s: String = row.get(8)?;
-    let offsets_s: Option<String> = row.get(9)?;
+    let legacy_offsets_s: Option<String> = row.get(9)?;
+    let anchors_s: Option<String> = row.get(10)?;
+
+    // Prefer the new `scrub_anchors` column. For older rows that only have
+    // `transcript_offsets`, lift those into anchors.files so the scrubber
+    // sees a uniform shape regardless of when the row was written.
+    let scrub_anchors: ScrubAnchors = match anchors_s
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<ScrubAnchors>(s).ok())
+    {
+        Some(a) => a,
+        None => {
+            let files: HashMap<String, u64> = legacy_offsets_s
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            ScrubAnchors {
+                files,
+                files_precount: HashMap::new(),
+                sqlite: HashMap::new(),
+            }
+        }
+    };
+
     Ok(LedgerEntry {
         release_id: row.get(0)?,
         session_id: row.get(1)?,
@@ -247,14 +330,12 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<LedgerEntry> {
         channel: Channel::parse(&channel_s),
         plaintext_seen_locally: row.get::<_, i64>(7)? != 0,
         transcript_paths: serde_json::from_str(&paths_s).unwrap_or_default(),
-        transcript_offsets: offsets_s
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default(),
-        released_at: row.get(10)?,
-        scrubbed_at: row.get(11)?,
-        rotated_at: row.get(12)?,
-        trigger_that_fired: row.get(13)?,
-        scrub_verified: row.get::<_, i64>(14)? != 0,
+        scrub_anchors,
+        released_at: row.get(11)?,
+        scrubbed_at: row.get(12)?,
+        rotated_at: row.get(13)?,
+        trigger_that_fired: row.get(14)?,
+        scrub_verified: row.get::<_, i64>(15)? != 0,
     })
 }
 
@@ -292,7 +373,11 @@ mod tests {
             channel: Channel::Ipc,
             plaintext_seen_locally: true,
             transcript_paths: vec!["/tmp/x.jsonl".into()],
-            transcript_offsets: HashMap::from([("/tmp/x.jsonl".to_string(), 100u64)]),
+            scrub_anchors: ScrubAnchors {
+                files: HashMap::from([("/tmp/x.jsonl".to_string(), 100u64)]),
+                files_precount: HashMap::new(),
+                sqlite: HashMap::new(),
+            },
             released_at: "2026-05-01T00:00:00Z".into(),
             scrubbed_at: None,
             rotated_at: None,
@@ -331,5 +416,83 @@ mod tests {
         let open = l.list_unscrubbed().unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].release_id, "rls_b");
+    }
+
+    #[test]
+    fn anchors_round_trip_files_only() {
+        let l = Ledger::open_in_memory().unwrap();
+        let entry = fixture("rls_files");
+        l.insert(&entry).unwrap();
+        let got = l.get("rls_files").unwrap().unwrap();
+        assert_eq!(got.scrub_anchors, entry.scrub_anchors);
+        assert_eq!(got.scrub_anchors.files["/tmp/x.jsonl"], 100u64);
+        assert!(got.scrub_anchors.sqlite.is_empty());
+    }
+
+    #[test]
+    fn anchors_round_trip_with_sqlite() {
+        let l = Ledger::open_in_memory().unwrap();
+        let mut entry = fixture("rls_sql");
+        let mut max_rowids = HashMap::new();
+        max_rowids.insert("memories".to_string(), 4242i64);
+        max_rowids.insert("threads".to_string(), 17i64);
+        entry.scrub_anchors.sqlite.insert(
+            "/Users/u/.openclaw/memory/main.sqlite".to_string(),
+            SqliteAnchor {
+                max_rowids,
+                wal_frame: Some(99),
+            },
+        );
+        l.insert(&entry).unwrap();
+
+        let got = l.get("rls_sql").unwrap().unwrap();
+        assert_eq!(got.scrub_anchors, entry.scrub_anchors);
+        let sql = &got.scrub_anchors.sqlite["/Users/u/.openclaw/memory/main.sqlite"];
+        assert_eq!(sql.max_rowids["memories"], 4242);
+        assert_eq!(sql.wal_frame, Some(99));
+    }
+
+    /// Older rows wrote `transcript_offsets` and never `scrub_anchors`. The
+    /// reader has to lift those into `anchors.files` so callers see one shape.
+    #[test]
+    fn legacy_transcript_offsets_lift_into_anchors() {
+        let l = Ledger::open_in_memory().unwrap();
+        // Bypass the normal `insert` path to write a row that mimics what
+        // an older daemon would have produced: transcript_offsets populated,
+        // scrub_anchors NULL.
+        {
+            let conn = l.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO releases (
+                    release_id, session_id, value_hash, tier, agent_runtime, mcp_mode,
+                    channel, plaintext_seen_locally, transcript_paths, transcript_offsets,
+                    scrub_anchors, released_at, scrubbed_at, rotated_at, trigger_that_fired,
+                    scrub_verified
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    "rls_legacy",
+                    "s1",
+                    "h",
+                    "\"l1\"",
+                    "\"claude-code\"",
+                    Option::<String>::None,
+                    "ipc",
+                    1i64,
+                    "[\"/tmp/old.jsonl\"]",
+                    "{\"/tmp/old.jsonl\":7}",
+                    Option::<String>::None,
+                    "2026-05-01T00:00:00Z",
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    0i64,
+                ],
+            )
+            .unwrap();
+        }
+
+        let got = l.get("rls_legacy").unwrap().unwrap();
+        assert_eq!(got.scrub_anchors.files["/tmp/old.jsonl"], 7u64);
+        assert!(got.scrub_anchors.sqlite.is_empty());
     }
 }

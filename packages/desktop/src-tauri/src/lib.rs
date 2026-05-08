@@ -3,8 +3,13 @@ pub mod daemon;
 pub mod ipc;
 pub mod keychain;
 pub mod ledger;
+pub mod mcp;
+pub mod proxy;
+pub mod release_stream;
 pub mod scrubber;
+pub mod setup;
 pub mod triggers;
+pub mod upstream;
 
 use std::sync::Arc;
 
@@ -113,6 +118,40 @@ async fn clear_config() -> Result<(), String> {
     config::clear().map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn mcp_install_status() -> Result<setup::McpInstallStatus, String> {
+    Ok(setup::probe_status())
+}
+
+/// Install the local-MCP entry for the named runtime. The `runtime`
+/// string is one of `"claude_code" | "claude_desktop" | "codex" | "openclaw"`.
+#[tauri::command]
+async fn mcp_install(state: tauri::State<'_, AppState>, runtime: String) -> Result<(), String> {
+    let port = state
+        .http_port
+        .ok_or_else(|| "daemon HTTP port not bound".to_string())?;
+    let res = match runtime.as_str() {
+        "claude_code" => setup::claude_code::install(port),
+        "claude_desktop" => setup::claude_desktop::install(port),
+        "codex" => setup::codex::install(port),
+        "openclaw" => setup::openclaw::install(port),
+        other => return Err(format!("unknown runtime: {other}")),
+    };
+    res.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn mcp_uninstall(runtime: String) -> Result<(), String> {
+    let res = match runtime.as_str() {
+        "claude_code" => setup::claude_code::uninstall(),
+        "claude_desktop" => setup::claude_desktop::uninstall(),
+        "codex" => setup::codex::uninstall(),
+        "openclaw" => setup::openclaw::uninstall(),
+        other => return Err(format!("unknown runtime: {other}")),
+    };
+    res.map_err(|e| format!("{e:#}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = tracing_subscriber::fmt()
@@ -152,11 +191,77 @@ pub fn run() {
                 }
             });
 
+            // If config is present, spin up the local MCP server so it
+            // mounts on the same listener as /release and /stop. This
+            // keeps the desktop daemon a single-process app — the agent
+            // talks to one address for everything.
+            //
+            // No config = no API key = no upstream calls possible, so
+            // we skip the MCP mount; once the user signs in, the next
+            // app launch will bring it up. Live re-mount-without-restart
+            // is a future improvement (gate at tool-call time on a
+            // current-config snapshot).
+            let (mcp_router, proxy_router): (Option<axum::Router>, Option<axum::Router>) =
+                match config::load() {
+                    Ok(Some(cfg)) => {
+                        let mcp = match crate::upstream::UpstreamClient::new(
+                            cfg.base_url.clone(),
+                            cfg.api_key.clone(),
+                        ) {
+                            Ok(client) => Some(crate::mcp::router(
+                                Arc::clone(&daemon),
+                                client,
+                                // Runtime is per-MCP-entry — Setup will
+                                // register separate /mcp paths per agent
+                                // later. For now, OpenClaw is the
+                                // safest default; other runtimes get
+                                // added explicitly via Setup UX.
+                                crate::daemon::release::AgentRuntime::Openclaw,
+                            )),
+                            Err(e) => {
+                                tracing::warn!("upstream client init failed: {e:#}");
+                                None
+                            }
+                        };
+                        // Tier-B proxy lives alongside /mcp; it forwards
+                        // /agent/* with the agent's own Bearer header so
+                        // it doesn't depend on the daemon's configured
+                        // key matching the agent's.
+                        let proxy = match crate::proxy::ProxyState::with_backend(
+                            Arc::clone(&daemon),
+                            crate::daemon::release::AgentRuntime::Openclaw,
+                            &cfg.base_url,
+                        ) {
+                            Ok(state) => Some(crate::proxy::router(state)),
+                            Err(e) => {
+                                tracing::warn!("proxy init failed: {e:#}");
+                                None
+                            }
+                        };
+                        (mcp, proxy)
+                    }
+                    Ok(None) => {
+                        tracing::info!("no config — skipping MCP/proxy mount until sign-in");
+                        (None, None)
+                    }
+                    Err(e) => {
+                        tracing::warn!("config load failed: {e:#}");
+                        (None, None)
+                    }
+                };
+            // Merge MCP + proxy into one router for the localhost listener.
+            let extra_router: Option<axum::Router> = match (mcp_router, proxy_router) {
+                (Some(m), Some(p)) => Some(m.merge(p)),
+                (Some(m), None) => Some(m),
+                (None, Some(p)) => Some(p),
+                (None, None) => None,
+            };
+
             // Localhost HTTP — bind synchronously to capture the port, then
             // serve() spawns the axum server onto the runtime internally.
             let ipc_http = ipc.clone();
             let http_port: Option<u16> = tauri::async_runtime::block_on(async move {
-                match ipc::localhost_http::serve(ipc_http).await {
+                match ipc::localhost_http::serve(ipc_http, extra_router).await {
                     Ok(p) => Some(p),
                     Err(e) => {
                         tracing::error!("localhost http bind: {e:#}");
@@ -164,6 +269,18 @@ pub fn run() {
                     }
                 }
             });
+
+            // Tier-C: subscribe to the backend's per-API-key release
+            // stream so the daemon learns about cloud-MCP retrievals
+            // it didn't proxy itself. Spawn only when config is loaded.
+            if let Ok(Some(cfg)) = config::load() {
+                crate::release_stream::spawn(
+                    Arc::clone(&daemon),
+                    cfg.base_url.clone(),
+                    cfg.api_key.clone(),
+                    crate::daemon::release::AgentRuntime::Openclaw,
+                );
+            }
 
             // WebSocket client — only runs if RIVAULT_DAEMON_WS_URL is set.
             ipc::websocket::spawn_if_configured(ipc.clone());
@@ -188,7 +305,10 @@ pub fn run() {
             daemon_status,
             get_config_status,
             save_config,
-            clear_config
+            clear_config,
+            mcp_install_status,
+            mcp_install,
+            mcp_uninstall
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

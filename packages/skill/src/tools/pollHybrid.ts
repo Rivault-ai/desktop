@@ -1,7 +1,6 @@
 import type { Tool, ToolResult } from './types.js'
 import { textResult } from './types.js'
 import type { RivaultClient } from '../client.js'
-import { emitRelease } from '../lib/daemonEmit.js'
 
 export function createPollHybridTool(client: RivaultClient): Tool {
   return {
@@ -44,16 +43,8 @@ export function createPollHybridTool(client: RivaultClient): Tool {
 
             if (result.authorizedValues && Object.keys(result.authorizedValues).length > 0) {
               parts.push(`\nAuthorized vault values:`)
-              const identity = await client.identityCached()
               for (const [itemId, value] of Object.entries(result.authorizedValues)) {
                 parts.push(`  vault:auth:${itemId}=${value}`)
-                await emitRelease({
-                  userId: identity.userId,
-                  apiKeyId: identity.apiKeyId ?? '',
-                  itemId,
-                  tier: 'L2',
-                  plaintext: value,
-                })
               }
             }
 
