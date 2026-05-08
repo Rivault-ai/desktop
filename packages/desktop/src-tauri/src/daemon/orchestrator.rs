@@ -368,7 +368,11 @@ impl Daemon {
                 );
             }
             let me = Arc::clone(self);
-            tokio::spawn(async move {
+            // `recover_unscrubbed` is called from Tauri's main-thread
+            // setup closure where there's no thread-local tokio runtime
+            // context, so bare `tokio::spawn` would panic. Use Tauri's
+            // explicit-handle wrapper instead.
+            tauri::async_runtime::spawn(async move {
                 let _ = me
                     .run_lifecycle(entry.release_id, paths, needles, anchors, false, rx)
                     .await;
