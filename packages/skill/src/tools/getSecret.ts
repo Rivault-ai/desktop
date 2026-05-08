@@ -1,7 +1,6 @@
 import type { Tool, ToolResult } from './types.js'
 import { textResult } from './types.js'
 import type { RivaultClient } from '../client.js'
-import { emitRelease } from '../lib/daemonEmit.js'
 
 export function createGetSecretTool(client: RivaultClient): Tool {
   return {
@@ -29,15 +28,6 @@ export function createGetSecretTool(client: RivaultClient): Tool {
               `Use rivault_request_auth with item_id "${itemId}" to request authorization.`,
           )
         }
-
-        const identity = await client.identityCached()
-        await emitRelease({
-          userId: identity.userId,
-          apiKeyId: identity.apiKeyId ?? '',
-          itemId,
-          tier: 'L1',
-          plaintext: result.value,
-        })
 
         return textResult(
           `vault:${result.label}=${result.value}\n` +
