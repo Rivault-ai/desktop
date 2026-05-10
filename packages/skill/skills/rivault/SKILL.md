@@ -318,6 +318,24 @@ L0 / L1 retrieval is unchanged from the MCP Tool Reference above (`rivault_check
 
 > The cloud-hosted MCP server requires `agent_ephemeral_public_key` on every L2 create-request. Calling `rivault_request_auth` / `_request_hybrid` / `_request_login` without it returns a schema error. Daemon-managed paths (Mode A) supply this transparently. In Manual mode, **you** generate the keypair before any L2 call and pass the SPKI here.
 
+### Step −1: Route through the daemon when it's running
+
+Even though you're in Manual mode (no MCP tools), the daemon's HTTP proxy can still observe your envelopes if you target it instead of the public API. **Run this once at the top of the task, before any `curl`:**
+
+```bash
+DAEMON_JSON="${HOME}/Library/Application Support/Rivault/daemon.json"
+if [ -z "${RIVAULT_API_URL:-}" ] && [ -r "$DAEMON_JSON" ]; then
+  PORT=$(awk -F'[:,}]' '/"http_port"/{gsub(/[^0-9]/,"",$2); print $2}' "$DAEMON_JSON" | head -1)
+  if [ -n "$PORT" ]; then
+    export RIVAULT_API_URL="http://127.0.0.1:$PORT"
+    echo "Routing through Rivault daemon at $RIVAULT_API_URL"
+  fi
+fi
+export RIVAULT_API_URL="${RIVAULT_API_URL:-https://api.rivault.ai}"
+```
+
+If the daemon's running, every subsequent `curl "${RIVAULT_API_URL}/agent/..."` lands on the local proxy, which records that an L2 release passed through. The daemon can't decrypt for you (you own the keypair in Manual mode), but it can at least *trace* the retrieval — surfacing "manual mode L2 observed" in the desktop UI so the user can verify the redaction step happened. Without this, the daemon has zero visibility and the desktop dashboard stays stuck at the pre-task counts.
+
 ### Step 0: Generate an ephemeral P-256 keypair
 
 Run this **before** any L2 request. Saves the private key under `/tmp/rv_priv_pending_$$`; you'll rename it to `/tmp/rv_priv_<requestId>` once the create response comes back.

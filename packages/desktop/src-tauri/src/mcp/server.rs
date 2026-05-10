@@ -375,6 +375,45 @@ impl RivaultMcp {
         }
     }
 
+    #[tool(
+        description = "Wait for the user to approve a Face ID authorization request, \
+                       polling internally with 3-8s backoff for up to 3 minutes. \
+                       Returns the same shape as rivault_poll_auth but the agent \
+                       doesn't have to loop. Prefer this over rivault_poll_auth in \
+                       runtimes without a background poller (Claude Code, Codex, \
+                       Claude Desktop). Use rivault_poll_auth when you have a \
+                       runtime-provided poller (OpenClaw)."
+    )]
+    async fn rivault_await_auth(
+        &self,
+        Parameters(PollAuthArgs { auth_request_id }): Parameters<PollAuthArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let timeout = Duration::from_secs(180);
+        let mut interval = Duration::from_secs(3);
+        let session_id = mcp_session_id(&ctx);
+        loop {
+            let outcome = self
+                .upstream
+                .poll_auth_status(&auth_request_id)
+                .await
+                .map_err(|e| upstream_err("rivault_await_auth", e))?;
+            if matches!(outcome, AuthStatusOutcome::Pending) {
+                if start.elapsed() >= timeout {
+                    return Ok(json_result(serde_json::json!({"status": "expired"})));
+                }
+                tokio::time::sleep(interval).await;
+                if interval < Duration::from_secs(8) {
+                    interval += Duration::from_secs(1);
+                }
+                continue;
+            }
+            return self.format_auth_outcome(outcome, &session_id, &ctx);
+        }
+    }
+
     // ---- L2: form-request flow ----------------------------------------
 
     #[tool(
@@ -542,6 +581,42 @@ impl RivaultMcp {
         }
     }
 
+    #[tool(
+        description = "Wait for the user to complete a hybrid request, polling \
+                       internally with 3-8s backoff for up to 3 minutes. Same \
+                       response shape as rivault_poll_hybrid. Prefer this in \
+                       runtimes without a background poller."
+    )]
+    async fn rivault_await_hybrid(
+        &self,
+        Parameters(PollHybridArgs { hybrid_request_id }): Parameters<PollHybridArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let timeout = Duration::from_secs(180);
+        let mut interval = Duration::from_secs(3);
+        let session_id = mcp_session_id(&ctx);
+        loop {
+            let outcome = self
+                .upstream
+                .poll_hybrid_status(&hybrid_request_id)
+                .await
+                .map_err(|e| upstream_err("rivault_await_hybrid", e))?;
+            if matches!(outcome, HybridStatusOutcome::Pending) {
+                if start.elapsed() >= timeout {
+                    return Ok(json_result(serde_json::json!({"status": "expired"})));
+                }
+                tokio::time::sleep(interval).await;
+                if interval < Duration::from_secs(8) {
+                    interval += Duration::from_secs(1);
+                }
+                continue;
+            }
+            return self.format_hybrid_outcome(outcome, &session_id, &ctx);
+        }
+    }
+
     // ---- L2: login-request flow ---------------------------------------
 
     #[tool(
@@ -621,6 +696,42 @@ impl RivaultMcp {
             }
         }
     }
+
+    #[tool(
+        description = "Wait for the user to submit a new-login request, polling \
+                       internally with 3-8s backoff for up to 3 minutes. Same \
+                       response shape as rivault_poll_login. Prefer this in \
+                       runtimes without a background poller."
+    )]
+    async fn rivault_await_login(
+        &self,
+        Parameters(PollLoginArgs { login_request_id }): Parameters<PollLoginArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let timeout = Duration::from_secs(180);
+        let mut interval = Duration::from_secs(3);
+        let session_id = mcp_session_id(&ctx);
+        loop {
+            let outcome = self
+                .upstream
+                .poll_login_status(&login_request_id)
+                .await
+                .map_err(|e| upstream_err("rivault_await_login", e))?;
+            if matches!(outcome, LoginStatusOutcome::Pending) {
+                if start.elapsed() >= timeout {
+                    return Ok(json_result(serde_json::json!({"status": "expired"})));
+                }
+                tokio::time::sleep(interval).await;
+                if interval < Duration::from_secs(8) {
+                    interval += Duration::from_secs(1);
+                }
+                continue;
+            }
+            return self.format_login_outcome(outcome, &session_id, &ctx);
+        }
+    }
 }
 
 #[tool_handler]
@@ -646,11 +757,15 @@ impl ServerHandler for RivaultMcp {
                field name (e.g. 'email' then 'phone').\n\
              - L1 items (sensitivityLevel=1): retrieve via rivault_get_secret.\n\
              - L2 items (sensitivityLevel=2): if you need only ONE, use \
-               rivault_request_auth + rivault_poll_auth. If you need MULTIPLE, \
+               rivault_request_auth + rivault_await_auth. If you need MULTIPLE, \
                or a mix of L2 items + missing fields, use rivault_request_hybrid \
-               + rivault_poll_hybrid — that's ONE approval link instead of N. \
+               + rivault_await_hybrid — that's ONE approval link instead of N. \
                Calling rivault_request_auth in a loop for multiple items is the \
-               single most common misuse; don't do it."
+               single most common misuse; don't do it.\n\
+             - After request_auth/hybrid/login, prefer `rivault_await_*` over \
+               `rivault_poll_*`. The await variant blocks internally for up to \
+               3 minutes with 3-8s backoff, returning when the user approves \
+               (or denies / expires). One tool call, no polling loop needed."
                 .into(),
         );
         info
@@ -660,6 +775,144 @@ impl ServerHandler for RivaultMcp {
 // ---- helpers --------------------------------------------------------------
 
 impl RivaultMcp {
+    /// Render a non-pending [`AuthStatusOutcome`] into a tool result + log
+    /// the release row when plaintext is present. Shared between
+    /// `rivault_poll_auth` (one-shot) and `rivault_await_auth` (blocking
+    /// loop) so the response shape and ledger semantics stay identical.
+    ///
+    /// Callers must filter out `Pending` themselves — this function
+    /// assumes the caller has decided not to retry.
+    fn format_auth_outcome(
+        &self,
+        outcome: AuthStatusOutcome,
+        session_id: &str,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        match outcome {
+            AuthStatusOutcome::Pending => Ok(json_result(serde_json::json!({
+                "status": "pending",
+            }))),
+            AuthStatusOutcome::Denied => Ok(json_result(serde_json::json!({
+                "status": "denied",
+            }))),
+            AuthStatusOutcome::Expired => Ok(json_result(serde_json::json!({
+                "status": "expired",
+            }))),
+            AuthStatusOutcome::ApprovedNoEnvelope => Ok(json_result(serde_json::json!({
+                "status": "approved_no_envelope",
+                "hint": "cache TTL elapsed; re-request auth",
+            }))),
+            AuthStatusOutcome::Approved {
+                plaintext,
+                kind,
+                username,
+                website,
+            } => {
+                let value = String::from_utf8_lossy(&plaintext).into_owned();
+                self.log_release(Tier::L2, &value, session_id, ctx)
+                    .map_err(|e| internal_err("log release", e))?;
+                Ok(json_result(serde_json::json!({
+                    "status": "approved",
+                    "type": kind,
+                    "value": value,
+                    "username": username,
+                    "website": website,
+                })))
+            }
+            AuthStatusOutcome::Other(s) => {
+                Ok(json_result(serde_json::json!({"status": s})))
+            }
+        }
+    }
+
+    /// Hybrid analogue of [`format_auth_outcome`]. Same shared role.
+    fn format_hybrid_outcome(
+        &self,
+        outcome: HybridStatusOutcome,
+        session_id: &str,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        match outcome {
+            HybridStatusOutcome::Pending => Ok(json_result(serde_json::json!({
+                "status": "pending"
+            }))),
+            HybridStatusOutcome::Expired => Ok(json_result(serde_json::json!({
+                "status": "expired"
+            }))),
+            HybridStatusOutcome::Other(s) => {
+                Ok(json_result(serde_json::json!({"status": s})))
+            }
+            HybridStatusOutcome::Submitted(submitted) => {
+                let mut authorized = serde_json::Map::new();
+                for (item_id, item) in submitted.authorized_items {
+                    let value = String::from_utf8_lossy(&item.plaintext).into_owned();
+                    self.log_release(Tier::L2, &value, session_id, ctx)
+                        .map_err(|e| internal_err("log release (auth item)", e))?;
+                    authorized.insert(
+                        item_id,
+                        serde_json::json!({
+                            "type": item.kind,
+                            "value": value,
+                            "username": item.username,
+                            "website": item.website,
+                        }),
+                    );
+                }
+                let mut form = serde_json::Map::new();
+                for (key, bytes) in submitted.form_values {
+                    let value = String::from_utf8_lossy(&bytes).into_owned();
+                    self.log_release(Tier::L2, &value, session_id, ctx)
+                        .map_err(|e| internal_err("log release (form field)", e))?;
+                    form.insert(key, serde_json::Value::String(value));
+                }
+                Ok(json_result(serde_json::json!({
+                    "status": "submitted",
+                    "authorized": authorized,
+                    "form": form,
+                    "createdItemIds": submitted.created_item_ids,
+                })))
+            }
+        }
+    }
+
+    /// Login analogue of [`format_auth_outcome`].
+    fn format_login_outcome(
+        &self,
+        outcome: LoginStatusOutcome,
+        session_id: &str,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        match outcome {
+            LoginStatusOutcome::Pending => Ok(json_result(serde_json::json!({
+                "status": "pending"
+            }))),
+            LoginStatusOutcome::Denied => Ok(json_result(serde_json::json!({
+                "status": "denied"
+            }))),
+            LoginStatusOutcome::Expired => Ok(json_result(serde_json::json!({
+                "status": "expired"
+            }))),
+            LoginStatusOutcome::Other(s) => {
+                Ok(json_result(serde_json::json!({"status": s})))
+            }
+            LoginStatusOutcome::Submitted {
+                plaintext,
+                login_item_id,
+                website,
+            } => {
+                let value = String::from_utf8_lossy(&plaintext).into_owned();
+                self.log_release(Tier::L2, &value, session_id, ctx)
+                    .map_err(|e| internal_err("log release", e))?;
+                Ok(json_result(serde_json::json!({
+                    "status": "submitted",
+                    "value": value,
+                    "loginItemId": login_item_id,
+                    "website": website,
+                })))
+            }
+        }
+    }
+
     /// Build a release event for the just-retrieved plaintext and hand it
     /// to the daemon's existing `accept` flow. That validates the
     /// transcript path against the runtime's allowlist, inserts the
