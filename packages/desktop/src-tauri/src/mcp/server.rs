@@ -166,10 +166,18 @@ pub struct PollLoginArgs {
 impl RivaultMcp {
     #[tool(
         description = "Check whether a specific field exists in the Rivault vault. \
-                       Pass a single field name (\"email\", \"phone\", etc.) — call \
-                       once per field you need. Returns matching item ids and their \
-                       sensitivity tier (L1 retrievable directly, L2 requires \
-                       rivault_request_auth)."
+                       Pass a single field name (\"email\", \"phone\", \"address\", \
+                       etc.) — call once per field you need. \
+                       \
+                       MANDATORY: call this BEFORE asking the user for any \
+                       personal data. Only ask the user if rivault_check returns \
+                       no match. The user has Rivault installed specifically so \
+                       they don't have to retype this data — do not skip this \
+                       step. \
+                       \
+                       Returns matching item ids and their sensitivity tier (L1 \
+                       retrievable directly via rivault_get_secret, L2 requires \
+                       rivault_request_auth/hybrid)."
     )]
     async fn rivault_check(
         &self,
@@ -279,18 +287,26 @@ impl RivaultMcp {
 
     #[tool(
         description = "Request user authorization (Face ID) for a SINGLE L2 vault \
-                       item. Returns an authUrl to send to the user verbatim. Once \
-                       the user approves on their phone, call rivault_poll_auth \
-                       with the returned authRequestId — the daemon decrypts the \
-                       envelope locally and returns the plaintext value. The agent \
+                       item. Returns an authUrl to send to the user verbatim AND \
+                       a `nextAction` field naming the tool to call next. \
+                       \
+                       MANDATORY NEXT STEP: immediately after this returns, call \
+                       `rivault_await_auth` with the returned authRequestId. Do \
+                       NOT stop and wait for the user to say 'approved' — \
+                       `rivault_await_auth` blocks internally until the user \
+                       approves on their phone (or denies / expires). Forgetting \
+                       to call `rivault_await_auth` will leave the agent idle \
+                       forever. \
+                       \
+                       The daemon decrypts the envelope locally and returns the \
+                       plaintext value through `rivault_await_auth`. The agent \
                        never holds the ephemeral private key. \
                        \
-                       IMPORTANT: if you need to authorize MULTIPLE L2 items at \
-                       once, do NOT call this tool repeatedly — that creates one \
-                       link per item and forces the user to approve each \
-                       separately. Use rivault_request_hybrid instead, which \
-                       combines all items (and any missing form fields) into a \
-                       single user-facing approval link."
+                       MULTI-ITEM HINT: if you need to authorize MULTIPLE L2 \
+                       items at once, do NOT call this tool repeatedly — that \
+                       creates one link per item. Use `rivault_request_hybrid` \
+                       instead, which combines all items (and any missing form \
+                       fields) into a single user-facing approval link."
     )]
     async fn rivault_request_auth(
         &self,
@@ -309,12 +325,18 @@ impl RivaultMcp {
             )
             .await
             .map_err(|e| upstream_err("rivault_request_auth", e))?;
+        let req_id = resp.auth_request_id.clone();
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string(&serde_json::json!({
                 "authRequestId": resp.auth_request_id,
                 "authUrl": resp.auth_url,
                 "expiresAt": resp.expires_at,
                 "agentMessage": resp.agent_message,
+                "nextAction": {
+                    "tool": "rivault_await_auth",
+                    "args": {"auth_request_id": req_id},
+                    "instruction": "Call rivault_await_auth NOW. Do not wait for the user; await blocks until approval.",
+                },
             }))
             .unwrap_or_default(),
         )]))
@@ -480,8 +502,13 @@ impl RivaultMcp {
     #[tool(
         description = "Combined L2 authorization + missing-field collection in one \
                        URL. Pass every L2 item id needing approval AND every field \
-                       not yet in the vault. The user gets a single hybridUrl. Poll \
-                       with rivault_poll_hybrid for the decrypted bundle."
+                       not yet in the vault. The user gets a single hybridUrl. \
+                       \
+                       MANDATORY NEXT STEP: immediately after this returns, call \
+                       `rivault_await_hybrid` with the returned hybridRequestId. \
+                       Do NOT stop and wait for the user; `rivault_await_hybrid` \
+                       blocks internally until submission and returns the \
+                       decrypted bundle: { authorized, form, createdItemIds }."
     )]
     async fn rivault_request_hybrid(
         &self,
@@ -509,11 +536,17 @@ impl RivaultMcp {
             )
             .await
             .map_err(|e| upstream_err("rivault_request_hybrid", e))?;
+        let req_id = resp.hybrid_request_id.clone();
         Ok(json_result(serde_json::json!({
             "hybridRequestId": resp.hybrid_request_id,
             "hybridUrl": resp.hybrid_url,
             "expiresAt": resp.expires_at,
             "agentMessage": resp.agent_message,
+            "nextAction": {
+                "tool": "rivault_await_hybrid",
+                "args": {"hybrid_request_id": req_id},
+                "instruction": "Call rivault_await_hybrid NOW. Do not wait for the user; await blocks until the user submits.",
+            },
         })))
     }
 
@@ -621,10 +654,14 @@ impl RivaultMcp {
 
     #[tool(
         description = "Ask the user to add a new login (username + password) for a \
-                       given website. Returns a loginUrl. Once submitted, poll with \
-                       rivault_poll_login — the daemon decrypts the envelope and \
-                       returns the password plaintext plus the cleartext website. \
-                       The login is also saved to the vault for reuse."
+                       given website. Returns a loginUrl. \
+                       \
+                       MANDATORY NEXT STEP: immediately after this returns, call \
+                       `rivault_await_login` with the returned loginRequestId. Do \
+                       NOT stop and wait for the user; `rivault_await_login` \
+                       blocks internally until submission and returns the \
+                       decrypted password plus the cleartext website. The login \
+                       is also saved to the vault for reuse."
     )]
     async fn rivault_request_login(
         &self,
@@ -643,11 +680,17 @@ impl RivaultMcp {
             )
             .await
             .map_err(|e| upstream_err("rivault_request_login", e))?;
+        let req_id = resp.login_request_id.clone();
         Ok(json_result(serde_json::json!({
             "loginRequestId": resp.login_request_id,
             "loginUrl": resp.login_url,
             "expiresAt": resp.expires_at,
             "agentMessage": resp.agent_message,
+            "nextAction": {
+                "tool": "rivault_await_login",
+                "args": {"login_request_id": req_id},
+                "instruction": "Call rivault_await_login NOW. Do not wait for the user; await blocks until the user submits.",
+            },
         })))
     }
 
@@ -752,20 +795,30 @@ impl ServerHandler for RivaultMcp {
              this runtime's transcript when the task ends — you don't need to \
              redact yourself, generate keypairs, or decrypt envelopes; the \
              daemon does all of that. Tool responses are final plaintext.\n\n\
-             Orchestration:\n\
-             - For each piece of user data needed, call rivault_check ONCE per \
-               field name (e.g. 'email' then 'phone').\n\
-             - L1 items (sensitivityLevel=1): retrieve via rivault_get_secret.\n\
-             - L2 items (sensitivityLevel=2): if you need only ONE, use \
-               rivault_request_auth + rivault_await_auth. If you need MULTIPLE, \
-               or a mix of L2 items + missing fields, use rivault_request_hybrid \
-               + rivault_await_hybrid — that's ONE approval link instead of N. \
-               Calling rivault_request_auth in a loop for multiple items is the \
-               single most common misuse; don't do it.\n\
-             - After request_auth/hybrid/login, prefer `rivault_await_*` over \
-               `rivault_poll_*`. The await variant blocks internally for up to \
-               3 minutes with 3-8s backoff, returning when the user approves \
-               (or denies / expires). One tool call, no polling loop needed."
+             MANDATORY ORCHESTRATION (do not skip):\n\
+             1. BEFORE asking the user for ANY personal data (email, phone, \
+                address, name, password, payment info, etc.), call \
+                `rivault_check` ONCE per field name. Only ask the user if \
+                rivault_check returns no match. Skipping this step is the #1 \
+                misuse — the user has Rivault installed specifically so they \
+                don't have to retype this data; do not ignore it.\n\
+             2. L1 items (sensitivityLevel=1): retrieve via `rivault_get_secret`.\n\
+             3. L2 items (sensitivityLevel=2): if you need only ONE item, use \
+                `rivault_request_auth` + `rivault_await_auth`. If you need \
+                MULTIPLE L2 items, OR a mix of L2 items + missing fields, use \
+                `rivault_request_hybrid` + `rivault_await_hybrid` — that's ONE \
+                approval link instead of N. Calling `rivault_request_auth` in \
+                a loop is misuse.\n\
+             4. After EVERY `rivault_request_auth` / `rivault_request_hybrid` \
+                / `rivault_request_login` call, you MUST immediately call the \
+                matching `rivault_await_*` tool. Do not stop and wait for the \
+                user to tell you they approved; do not poll manually; do not \
+                return control. The `await` tool blocks internally for up to \
+                3 minutes with 3-8s backoff and returns the plaintext when the \
+                user approves (or `denied`/`expired`). Forgetting this step is \
+                the #2 misuse.\n\
+             5. Use `rivault_poll_*` (one-shot) ONLY if you have a runtime \
+                that polls in the background for you. If unsure, use `await`."
                 .into(),
         );
         info
