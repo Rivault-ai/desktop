@@ -278,12 +278,19 @@ impl RivaultMcp {
     // ---- L2: auth-request flow ----------------------------------------
 
     #[tool(
-        description = "Request user authorization (Face ID) for an L2 vault item. \
-                       Returns an authUrl to send to the user verbatim. Once the user \
-                       approves on their phone, call rivault_poll_auth with the \
-                       returned authRequestId — the daemon decrypts the envelope \
-                       locally and returns the plaintext value. The agent never \
-                       holds the ephemeral private key."
+        description = "Request user authorization (Face ID) for a SINGLE L2 vault \
+                       item. Returns an authUrl to send to the user verbatim. Once \
+                       the user approves on their phone, call rivault_poll_auth \
+                       with the returned authRequestId — the daemon decrypts the \
+                       envelope locally and returns the plaintext value. The agent \
+                       never holds the ephemeral private key. \
+                       \
+                       IMPORTANT: if you need to authorize MULTIPLE L2 items at \
+                       once, do NOT call this tool repeatedly — that creates one \
+                       link per item and forces the user to approve each \
+                       separately. Use rivault_request_hybrid instead, which \
+                       combines all items (and any missing form fields) into a \
+                       single user-facing approval link."
     )]
     async fn rivault_request_auth(
         &self,
@@ -630,8 +637,20 @@ impl ServerHandler for RivaultMcp {
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.server_info.title = Some("Rivault (local)".into());
         info.instructions = Some(
-            "Local Rivault MCP — every retrieval is recorded and \
-             redacted from this runtime's transcript when the task ends."
+            "Local Rivault MCP. Every retrieval is recorded and redacted from \
+             this runtime's transcript when the task ends — you don't need to \
+             redact yourself, generate keypairs, or decrypt envelopes; the \
+             daemon does all of that. Tool responses are final plaintext.\n\n\
+             Orchestration:\n\
+             - For each piece of user data needed, call rivault_check ONCE per \
+               field name (e.g. 'email' then 'phone').\n\
+             - L1 items (sensitivityLevel=1): retrieve via rivault_get_secret.\n\
+             - L2 items (sensitivityLevel=2): if you need only ONE, use \
+               rivault_request_auth + rivault_poll_auth. If you need MULTIPLE, \
+               or a mix of L2 items + missing fields, use rivault_request_hybrid \
+               + rivault_poll_hybrid — that's ONE approval link instead of N. \
+               Calling rivault_request_auth in a loop for multiple items is the \
+               single most common misuse; don't do it."
                 .into(),
         );
         info
