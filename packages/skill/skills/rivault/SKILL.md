@@ -13,14 +13,19 @@ You MUST use Rivault any time a task requires user information. Never ask the us
 
 Before any vault call, decide once which path you're using **and stick to it for the entire task**. Mixing the two paths is the most common cause of silent failures (key mismatches, ledger gaps, leaked plaintext). The two paths are mutually exclusive.
 
-**Inspect the tools available to you right now.** Do you see `mcp__rivault__rivault_*` (or your runtime's equivalent — a tool named `rivault_*` provided by a server called `rivault`, NOT `claude.ai Rivault`)?
+**Detection — by runtime.** A `rivault_*` family of tools may appear under different namespaces. Any of these qualifies as Mode A:
 
-- ✅ **Yes → Mode A (Daemon mode).** Continue with Rules 1-5 below using ONLY the `rivault_*` MCP tools. **Do NOT** generate keypairs, **do NOT** run `node -e` decrypt blocks, **do NOT** call the API via curl, **do NOT** read `/tmp/rv_priv_*`. The daemon does crypto and redaction. If a tool returns plaintext, that's what you use — there's nothing to decrypt.
-- ❌ **No → Mode B (Manual mode).** Skip the MCP-tool sections below and jump to **"Appendix: Manual mode"** at the bottom. You generate keypairs, supply pubkeys, decrypt envelopes, and `sed`-redact the session log yourself. Bash blocks live there.
+- **Claude Code / Codex / Claude Desktop**: tools named `mcp__rivault__rivault_*`. Provided by a registered MCP server named `rivault` pointing at `http://127.0.0.1:<port>/mcp`. (`mcp__claude_ai_Rivault__*` does NOT count — that's the cloud server, post-#71 returns envelopes, treat it as no Mode A available.)
+- **OpenClaw**: tools named plainly `rivault_*` (no `mcp__` prefix — they're loaded as a plugin, not an MCP server). Provided by the rivault skill plugin in `~/.openclaw/skills/rivault`. The plugin's HTTP client routes through the daemon transparently when the daemon is running.
+- **Anything else with a tool named `rivault_check`, `rivault_request_auth` etc. that isn't from `claude.ai Rivault`** — same deal, you're in Mode A.
 
-If you're in Mode A, **the rest of this document assumes Mode A**. The MCP tools handle every step that Mode B would do by hand. Reading the bash blocks in the Manual mode appendix and running them mid-task corrupts the daemon's keypair stash and breaks the redaction guarantee — both modes use the daemon's discovery/transcript-watching infrastructure but only one of them holds the right keypair at any given time.
+If any of those are visible: ✅ **Mode A (Daemon mode).** Continue with Rules 1-5 using ONLY those tools. **Do NOT** generate keypairs, **do NOT** run `node -e` decrypt blocks, **do NOT** call the API via curl, **do NOT** read `/tmp/rv_priv_*`. The daemon (or the skill plugin's HTTP client routing through the daemon) handles all crypto and redaction. If a tool returns a value, that's the plaintext — there's nothing to decrypt.
 
-If something feels missing in Mode A (e.g. "shouldn't I be decrypting an envelope?") — no, you shouldn't. The daemon already did. The tool response IS the plaintext.
+If none of those are visible (only `mcp__claude_ai_Rivault__*` exists, or you're calling raw curl): ❌ **Mode B (Manual mode).** Skip to **"Appendix: Manual mode"** at the bottom. You generate keypairs, supply pubkeys, decrypt envelopes, and `sed`-redact the session log yourself.
+
+If you're in Mode A, **the rest of this document assumes Mode A**. Reading the bash blocks in the Manual mode appendix and running them mid-task corrupts the daemon's keypair stash and breaks the redaction guarantee.
+
+If something feels missing in Mode A ("shouldn't I be decrypting an envelope?") — no, you shouldn't. The daemon already did. The tool response IS the plaintext.
 
 ### Rule 1: Verify ALL required fields by inspecting the actual target FIRST
 
