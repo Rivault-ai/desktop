@@ -56,6 +56,12 @@ struct OpenRelease {
 pub struct Daemon {
     ledger: Ledger,
     open_releases: Arc<Mutex<HashMap<String, OpenRelease>>>,
+    /// Serializes the read-modify-write phase of `scrub_paths` across all
+    /// releases so two concurrent scrubs targeting the same transcript
+    /// file don't clobber each other's redactions. Async-aware so we can
+    /// hold it across `await` points if the scrub ever becomes async; for
+    /// today's blocking `scrub_paths` it's just a critical section.
+    scrub_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Daemon {
@@ -63,6 +69,7 @@ impl Daemon {
         Self {
             ledger,
             open_releases: Arc::new(Mutex::new(HashMap::new())),
+            scrub_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -283,6 +290,14 @@ impl Daemon {
         let scrub_outcome = if needles.is_empty() {
             ScrubOutcome::Skipped
         } else {
+            // Serialize concurrent scrubs. Two parallel releases on the
+            // same transcript file would otherwise race: each one snapshots
+            // the file, modifies it, and writes it back; the later writer
+            // can clobber the earlier writer's redactions because its
+            // in-memory copy was taken before the earlier write. With this
+            // lock the second scrubber reads the post-first-scrub content
+            // and finds its own plaintext at the shifted position.
+            let _scrub_guard = self.scrub_mutex.lock().await;
             // File scrub first; result drives the verified flag.
             let mut outcome = match scrub_paths(&path_strs, &needles, &anchors) {
                 Ok(report) => {
@@ -444,11 +459,11 @@ fn precount_runtime_siblings(
             if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            // Skip the primary transcript paths themselves — they're
-            // covered by the byte-offset Scope-1 scrubber.
-            if validated.iter().any(|v| v == &p) {
-                continue;
-            }
+            // Include primary transcript paths as well. Scope-1 covers
+            // them via byte-offset slicing, but two concurrent releases
+            // on the same primary file can shift bytes underneath each
+            // other and leave residue Scope-1 misses. Carrying a
+            // precount lets Scope-2 rescue those cases.
             let Ok(bytes) = std::fs::read(&p) else {
                 continue;
             };
