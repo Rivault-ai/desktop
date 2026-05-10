@@ -5,7 +5,9 @@
 //! everything in the local ledger.
 
 pub mod allowlist;
+pub mod cross_runtime_scanner;
 pub mod orchestrator;
+pub mod recent_index;
 pub mod release;
 pub mod watcher;
 

@@ -3,10 +3,12 @@ import { createSearchTool } from './tools/search.js'
 import { createGetSecretTool } from './tools/getSecret.js'
 import { createRequestAuthTool } from './tools/requestAuth.js'
 import { createPollAuthTool } from './tools/pollAuth.js'
+import { createAwaitAuthTool } from './tools/awaitAuth.js'
 import { createRequestFormTool } from './tools/requestForm.js'
 import { createPollFormTool } from './tools/pollForm.js'
 import { createRequestHybridTool } from './tools/requestHybrid.js'
 import { createPollHybridTool } from './tools/pollHybrid.js'
+import { createAwaitHybridTool } from './tools/awaitHybrid.js'
 import type { Tool } from './tools/types.js'
 import { validateConfig, config } from './config.js'
 
@@ -46,10 +48,12 @@ export const skill = {
       createGetSecretTool(client),
       createRequestAuthTool(client),
       createPollAuthTool(client),
+      createAwaitAuthTool(client),
       createRequestFormTool(client),
       createPollFormTool(client),
       createRequestHybridTool(client),
       createPollHybridTool(client),
+      createAwaitHybridTool(client),
     ]
   },
 
@@ -97,27 +101,27 @@ type OpenClawApi = {
 export default function register(api: OpenClawApi): void {
   const cfg = (api.pluginConfig ?? {}) as PluginCfg
 
-  // Resolve the configured base URL once (this doesn't change at runtime).
-  const apiBaseUrl = cfg.apiUrl ?? config.apiBaseUrl
-
   // Tool definitions — name, description, schema only. No client yet.
   // The client is created lazily inside each execute() so it always picks up
-  // the current API key from pluginConfig or the environment at call time,
-  // rather than snapshotting a potentially empty key at gateway startup.
+  // the current API key AND base URL from pluginConfig or the environment at
+  // call time, rather than snapshotting a potentially empty key or stale URL
+  // at gateway startup.
   const toolFactories = [
     createSearchTool,
     createGetSecretTool,
     createRequestAuthTool,
     createPollAuthTool,
+    createAwaitAuthTool,
     createRequestFormTool,
     createPollFormTool,
     createRequestHybridTool,
     createPollHybridTool,
+    createAwaitHybridTool,
   ]
 
-  // Build tool metadata from a throwaway client (key doesn't matter here,
+  // Build tool metadata from a throwaway client (key/URL don't matter here,
   // only name/description/parameters are used from these objects).
-  const dummyClient = new RivaultClient('', apiBaseUrl)
+  const dummyClient = new RivaultClient('', 'https://api.rivault.ai')
   const toolMeta = toolFactories.map(f => f(dummyClient))
 
   for (const meta of toolMeta) {
@@ -133,9 +137,14 @@ export default function register(api: OpenClawApi): void {
         description: meta.description,
         parameters: toTypeBoxSchema(meta.parameters),
         async execute(_toolCallId: string, params: Record<string, unknown>) {
-          // Read the key fresh on every call — picks up changes made via the
-          // web UI or environment without requiring a gateway restart.
+          // Read both key and URL fresh on every call. `config.apiBaseUrl`
+          // performs daemon-URL discovery (~/Library/Application Support/
+          // Rivault/daemon.json, 30s-cached) so if the desktop app starts
+          // *after* the OpenClaw gateway, the next tool call still routes
+          // through the local daemon — which is what makes ledger rows
+          // and transcript scrubs work for OpenClaw end-to-end.
           const apiKey = cfg.apiKey ?? config.apiKey ?? ''
+          const apiBaseUrl = cfg.apiUrl ?? config.apiBaseUrl
           const client = new RivaultClient(apiKey, apiBaseUrl)
           const tool = toolFactories
             .map(f => f(client))
