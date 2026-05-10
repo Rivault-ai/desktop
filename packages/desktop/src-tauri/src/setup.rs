@@ -45,7 +45,19 @@ pub fn probe_status() -> McpInstallStatus {
     }
 }
 
-/// Build the URL the desktop app advertises to MCP clients.
+/// Build the MCP URL for a specific runtime. Each runtime registers its
+/// own URL with a `?runtime=` query param — the daemon's MCP server
+/// reads that param at tool-call time to set the right transcript
+/// directory and ledger `agent_runtime` tag. Without the param, every
+/// caller would be tagged with the daemon's bake-in default and the
+/// transcript-path resolver would pick the wrong session file.
+pub fn mcp_url_for(http_port: u16, runtime: &str) -> String {
+    format!("http://127.0.0.1:{http_port}/mcp?runtime={runtime}")
+}
+
+/// Legacy MCP URL (no runtime param). Kept for callers that don't know
+/// or don't care which runtime is asking. The daemon falls back to its
+/// bake-in default when the param is absent.
 pub fn mcp_url(http_port: u16) -> String {
     format!("http://127.0.0.1:{http_port}/mcp")
 }
@@ -151,7 +163,7 @@ pub mod claude_code {
 
     pub fn install(http_port: u16) -> Result<()> {
         let p = config_path()?;
-        let target = super::mcp_url(http_port);
+        let target = super::mcp_url_for(http_port, "claude_code");
         let root_text = if p.exists() {
             fs::read_to_string(&p)?
         } else {
@@ -245,7 +257,7 @@ pub mod claude_desktop {
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).ok();
         }
-        let target = super::mcp_url(http_port);
+        let target = super::mcp_url_for(http_port, "claude_desktop");
         let mut root: Value = if p.exists() {
             let text = fs::read_to_string(&p)?;
             serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
@@ -360,7 +372,7 @@ pub mod codex {
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).ok();
         }
-        let url = super::mcp_url(http_port);
+        let url = super::mcp_url_for(http_port, "codex");
         let target_block = format!(
             "{BEGIN}\n[mcp_servers.{ENTRY_NAME}]\nurl = \"{url}\"\n{END}\n",
         );
@@ -624,11 +636,11 @@ mod tests {
             let after = fs::read_to_string(&p).unwrap();
             assert!(after.contains("model = \"o4-mini\""));
             assert!(after.contains("[mcp_servers.rivault]"));
-            assert!(after.contains("http://127.0.0.1:47318/mcp"));
+            assert!(after.contains("http://127.0.0.1:47318/mcp?runtime=codex"));
             // Re-install replaces the managed block in place.
             codex::install(47319).unwrap();
             let after = fs::read_to_string(&p).unwrap();
-            assert!(after.contains("http://127.0.0.1:47319/mcp"));
+            assert!(after.contains("http://127.0.0.1:47319/mcp?runtime=codex"));
             assert!(!after.contains("47318"));
             // Uninstall strips just our block.
             codex::uninstall().unwrap();
@@ -724,6 +736,9 @@ mod tests {
         let home = fresh_home();
         with_home(home.path(), || {
             // Previous run picked a different port; new run uses 47320.
+            // Also covers the "no-runtime-param" → "with-runtime-param"
+            // migration: an older daemon binary wrote `/mcp` without the
+            // query param, the new one must overwrite to add it.
             let p = home.path().join(".claude.json");
             fs::write(
                 &p,
@@ -735,7 +750,7 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
             assert_eq!(
                 v["mcpServers"]["rivault"]["url"],
-                "http://127.0.0.1:47320/mcp"
+                "http://127.0.0.1:47320/mcp?runtime=claude_code"
             );
         });
     }
@@ -745,10 +760,11 @@ mod tests {
         let home = fresh_home();
         with_home(home.path(), || {
             let p = home.path().join(".claude.json");
-            // Pre-existing file, exactly the URL we'd write.
+            // Pre-existing file, exactly the URL we'd write (with runtime
+            // param present).
             fs::write(
                 &p,
-                r#"{"mcpServers":{"rivault":{"type":"http","url":"http://127.0.0.1:47318/mcp"}}}"#,
+                r#"{"mcpServers":{"rivault":{"type":"http","url":"http://127.0.0.1:47318/mcp?runtime=claude_code"}}}"#,
             )
             .unwrap();
             let mtime_before = fs::metadata(&p).unwrap().modified().unwrap();

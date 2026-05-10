@@ -231,7 +231,7 @@ impl RivaultMcp {
                 // returning so the redaction guarantee holds even if the
                 // agent crashes mid-response.
                 let session_id = mcp_session_id(&ctx);
-                self.log_release(Tier::L1, &value, &session_id)
+                self.log_release(Tier::L1, &value, &session_id, &ctx)
                     .map_err(|e| internal_err("log release", e))?;
 
                 Ok(CallToolResult::success(vec![Content::text(
@@ -359,7 +359,7 @@ impl RivaultMcp {
                 website,
             } => {
                 let value = String::from_utf8_lossy(&plaintext).into_owned();
-                self.log_release(Tier::L2, &value, &session_id)
+                self.log_release(Tier::L2, &value, &session_id, &ctx)
                     .map_err(|e| internal_err("log release", e))?;
                 Ok(json_result(serde_json::json!({
                     "status": "approved",
@@ -509,7 +509,7 @@ impl RivaultMcp {
                 let mut authorized = serde_json::Map::new();
                 for (item_id, item) in submitted.authorized_items {
                     let value = String::from_utf8_lossy(&item.plaintext).into_owned();
-                    self.log_release(Tier::L2, &value, &session_id)
+                    self.log_release(Tier::L2, &value, &session_id, &ctx)
                         .map_err(|e| internal_err("log release (auth item)", e))?;
                     authorized.insert(
                         item_id,
@@ -528,7 +528,7 @@ impl RivaultMcp {
                     // they're brand-new and not stored as L2 in the vault.
                     // Tier::L2 here means "envelope-encrypted" — semantically
                     // accurate for redaction purposes.
-                    self.log_release(Tier::L2, &value, &session_id)
+                    self.log_release(Tier::L2, &value, &session_id, &ctx)
                         .map_err(|e| internal_err("log release (form field)", e))?;
                     form.insert(key, serde_json::Value::String(value));
                 }
@@ -610,7 +610,7 @@ impl RivaultMcp {
                 website,
             } => {
                 let value = String::from_utf8_lossy(&plaintext).into_owned();
-                self.log_release(Tier::L2, &value, &session_id)
+                self.log_release(Tier::L2, &value, &session_id, &ctx)
                     .map_err(|e| internal_err("log release", e))?;
                 Ok(json_result(serde_json::json!({
                     "status": "submitted",
@@ -665,10 +665,23 @@ impl RivaultMcp {
     /// transcript path against the runtime's allowlist, inserts the
     /// ledger row, and arms the watcher + hard cap; from there the
     /// existing scrub lifecycle takes over.
-    fn log_release(&self, tier: Tier, plaintext: &str, session_id: &str) -> anyhow::Result<()> {
+    fn log_release(
+        &self,
+        tier: Tier,
+        plaintext: &str,
+        session_id: &str,
+        ctx: &RequestContext<RoleServer>,
+    ) -> anyhow::Result<()> {
         let release_id = uuid::Uuid::new_v4().to_string();
         let value_hash = hex::encode(Sha256::digest(plaintext.as_bytes()));
-        let transcript_paths = resolve_transcript_paths(&self.runtime);
+        // Per-session runtime: each runtime registers a different MCP URL
+        // with a `?runtime=` query param (claude_code, codex,
+        // claude_desktop). At tool-call time we read that param off the
+        // request URI and use it for transcript-path resolution + the
+        // ledger row's runtime tag. Fallback: the daemon's bake-in
+        // default (`self.runtime`), which is set at server-mount time.
+        let runtime = runtime_from_request(ctx).unwrap_or_else(|| self.runtime.clone());
+        let transcript_paths = resolve_transcript_paths(&runtime);
         let released_at = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
@@ -677,7 +690,7 @@ impl RivaultMcp {
             release_id,
             session_id: session_id.to_string(),
             tier,
-            agent_runtime: self.runtime.clone(),
+            agent_runtime: runtime,
             // mcp_mode is None: the daemon (not the cloud MCP server)
             // performed the retrieval. The existing variants describe
             // who decrypted on the upstream side, which is moot here.
@@ -720,6 +733,47 @@ fn mcp_session_id(ctx: &RequestContext<RoleServer>) -> String {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("mcp-{}", uuid::Uuid::new_v4()))
+}
+
+/// Per-session runtime detection.
+///
+/// Each agent runtime is registered with a different MCP URL — the
+/// install commands write `http://127.0.0.1:<port>/mcp?runtime=claude_code`
+/// (or `codex` / `claude_desktop`). At tool-call time we read that
+/// query param off the request URI so the same daemon binary can serve
+/// multiple runtimes correctly: the right transcript directory is used
+/// for path resolution, and the ledger row's `agent_runtime` matches
+/// the agent that actually made the call.
+///
+/// Returns None when the param is absent or unrecognised, so the caller
+/// can fall back to the daemon's bake-in default.
+fn runtime_from_request(ctx: &RequestContext<RoleServer>) -> Option<AgentRuntime> {
+    let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
+    let query = parts.uri.query()?;
+    let value = query.split('&').find_map(|kv| {
+        let mut it = kv.splitn(2, '=');
+        let k = it.next()?;
+        let v = it.next()?;
+        if k == "runtime" {
+            Some(v)
+        } else {
+            None
+        }
+    })?;
+    parse_runtime(value)
+}
+
+fn parse_runtime(s: &str) -> Option<AgentRuntime> {
+    match s {
+        "claude_code" | "claude-code" | "claudecode" => Some(AgentRuntime::ClaudeCode),
+        "claude_desktop" | "claude-desktop" | "claudedesktop" => {
+            Some(AgentRuntime::ClaudeDesktop)
+        }
+        "codex" => Some(AgentRuntime::Codex),
+        "openclaw" => Some(AgentRuntime::Openclaw),
+        "custom" => Some(AgentRuntime::Custom),
+        _ => None,
+    }
 }
 
 fn upstream_err(op: &str, e: anyhow::Error) -> McpError {
