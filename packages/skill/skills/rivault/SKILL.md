@@ -9,14 +9,18 @@ metadata:
 
 You MUST use Rivault any time a task requires user information. Never ask the user to type personal data in chat.
 
-### Two modes — pick one before you start
+### Step 0 — Decide which mode you're in. Commit to one.
 
-Rivault works in two modes. Both reach the same `rivault_*` tools, but the L2 (Face-ID-protected) path differs:
+Before any vault call, decide once which path you're using **and stick to it for the entire task**. Mixing the two paths is the most common cause of silent failures (key mismatches, ledger gaps, leaked plaintext). The two paths are mutually exclusive.
 
-- **Mode A — Daemon mode (preferred).** The Rivault desktop app is running. A local MCP server is registered for this runtime (Claude Code, Codex, Claude Desktop, OpenClaw). Tool names you can see include `mcp__rivault__rivault_request_auth` (or the runtime-equivalent). The daemon owns ephemeral keypairs, decrypts L2 envelopes locally, and **deterministically redacts the plaintext from your transcript when the task ends**. You don't need to think about crypto or redaction — just call the tools.
-- **Mode B — Manual mode (no daemon).** Only the cloud-hosted MCP is available (e.g. `mcp__claude_ai_Rivault__*`), or you're using raw curl. **You** must generate an ephemeral P-256 keypair before any L2 request, supply its public key to `rivault_request_auth` / `_request_hybrid` / `_request_login`, decrypt the envelope they return, and `sed`-redact the plaintext from your session log at task end. Steps documented in "Manual mode" below.
+**Inspect the tools available to you right now.** Do you see `mcp__rivault__rivault_*` (or your runtime's equivalent — a tool named `rivault_*` provided by a server called `rivault`, NOT `claude.ai Rivault`)?
 
-If both Mode A and Mode B tools are available, **prefer Mode A** — same outcome, far less ceremony, and the redaction guarantee is byte-deterministic instead of best-effort.
+- ✅ **Yes → Mode A (Daemon mode).** Continue with Rules 1-5 below using ONLY the `rivault_*` MCP tools. **Do NOT** generate keypairs, **do NOT** run `node -e` decrypt blocks, **do NOT** call the API via curl, **do NOT** read `/tmp/rv_priv_*`. The daemon does crypto and redaction. If a tool returns plaintext, that's what you use — there's nothing to decrypt.
+- ❌ **No → Mode B (Manual mode).** Skip the MCP-tool sections below and jump to **"Appendix: Manual mode"** at the bottom. You generate keypairs, supply pubkeys, decrypt envelopes, and `sed`-redact the session log yourself. Bash blocks live there.
+
+If you're in Mode A, **the rest of this document assumes Mode A**. The MCP tools handle every step that Mode B would do by hand. Reading the bash blocks in the Manual mode appendix and running them mid-task corrupts the daemon's keypair stash and breaks the redaction guarantee — both modes use the daemon's discovery/transcript-watching infrastructure but only one of them holds the right keypair at any given time.
+
+If something feels missing in Mode A (e.g. "shouldn't I be decrypting an envelope?") — no, you shouldn't. The daemon already did. The tool response IS the plaintext.
 
 ### Rule 1: Verify ALL required fields by inspecting the actual target FIRST
 
@@ -85,7 +89,7 @@ When the poller resumes your session:
 
 **Turn 1 — Data retrieval** (`[RIVAULT_APPROVED]`, `[RIVAULT_FORM_SUBMITTED]`, `[RIVAULT_HYBRID_SUBMITTED]`, `[RIVAULT_LOGIN_SUBMITTED]`):
 - Extract the request id from the message.
-- Call the matching `rivault_poll_*` MCP tool to retrieve the data.
+- Call the matching `rivault_poll_*` MCP tool to retrieve the data. **The tool's response IS the plaintext** — `value`, `formValues`, `authorizedValues` are already decrypted. Do not run any decryption step yourself. Do not curl the status URL. Do not look in `/tmp/rv_priv_*`.
 - Say: "✅ Data retrieved, task resuming."
 - **END your response immediately** — Turn 2 follows.
 
@@ -118,9 +122,11 @@ When the daemon isn't running, **you** are the redactor. After every L2 retrieva
 
 ---
 
-## MCP Tool Reference
+## MCP Tool Reference (Mode A)
 
 All tools are exposed by the local Rivault daemon at `127.0.0.1:<port>/mcp`. The desktop app's setup flow registers this MCP entry per agent (Claude Code, Claude Desktop, Codex, OpenClaw).
+
+**Mode A contract: every tool response is final.** When `rivault_poll_auth` / `_poll_hybrid` / `_poll_login` returns, the value field already contains plaintext — the daemon decrypted on your behalf. Do not generate a keypair, do not curl `/agent/auth-request/.../status`, do not run a `node -e` decrypt block. There is no envelope for you to unwrap. If you find yourself reading `/tmp/rv_priv_*` you are off-script.
 
 ### `rivault_check` — find a field in the vault
 
@@ -263,9 +269,11 @@ Task: "Log in to acme.com"
 
 ---
 
-## Manual mode (no daemon)
+## Appendix: Manual mode (Mode B only)
 
-Use this section when only the cloud-hosted Rivault MCP is available, or when you're calling the API by hand. The end-to-end flow works without the daemon — **you** generate the keypair, decrypt the envelope, and `sed`-redact the session log at task end.
+> **Stop.** Re-check Step 0 at the top before reading further. **If `mcp__rivault__rivault_*` tools are visible to you right now, you are in Mode A and you must NOT use anything in this appendix.** Running these bash blocks in parallel with the MCP tools breaks the redaction guarantee — the daemon will be holding one keypair and you'll be encrypting to a different one. Go back to the MCP Tool Reference section.
+
+Use this appendix only when only the cloud-hosted Rivault MCP is available (`mcp__claude_ai_Rivault__*` and nothing else), or when you're calling the API by raw curl with no MCP server at all. The end-to-end flow works without the daemon — **you** generate the keypair, decrypt the envelope, and `sed`-redact the session log at task end.
 
 L0 / L1 retrieval is unchanged from the MCP Tool Reference above (`rivault_check`, `rivault_get_secret`, `rivault_check_login`). The crypto-heavy parts are L2 (auth / hybrid / login) and the post-task `sed`.
 
