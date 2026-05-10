@@ -161,6 +161,47 @@ pub fn scrub_paths(
     Ok(report)
 }
 
+/// Cross-runtime, anchor-free scrub used by the continuous scanner.
+///
+/// Different invariant from `scrub_paths`: there is no notion of "task
+/// window" or "pre-existing content I must preserve". The caller hands us
+/// a TTL-bounded set of plaintext values that the daemon believes are
+/// currently sensitive, and we redact **every** occurrence of those
+/// values (or their encoded variants) in the file. Pre-task / pre-release
+/// occurrences are intentionally redacted too — that is the whole point
+/// of the cross-session feature.
+///
+/// `needles` must already be built via `build_needles` (sorted longest-
+/// first to avoid substring shadowing).
+///
+/// Returns the number of redactions performed; 0 means the file was
+/// clean or unreadable.
+pub fn scrub_for_index(path: &Path, needles: &[String]) -> Result<usize> {
+    if needles.is_empty() {
+        return Ok(0);
+    }
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return Ok(0), // file disappeared mid-event; best-effort
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(0); // skip binary content
+    };
+    let mut s = text.to_string();
+    let mut hits = 0usize;
+    for n in needles {
+        let count = s.matches(n.as_str()).count();
+        if count > 0 {
+            s = s.replace(n.as_str(), REDACTION_MARKER);
+            hits += count;
+        }
+    }
+    if hits > 0 {
+        fs::write(path, s.as_bytes())?;
+    }
+    Ok(hits)
+}
+
 /// Scrub SQLite anchors (e.g. OpenClaw memory DB) for a release.
 ///
 /// Separate from `scrub_paths` because the failure semantics differ:

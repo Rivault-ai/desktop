@@ -28,6 +28,25 @@ pub fn default_roots(runtime: &AgentRuntime) -> Result<Vec<PathBuf>> {
     })
 }
 
+/// Union of every runtime's allowlist roots, with non-existent roots silently
+/// dropped. Used by the cross-runtime scanner to know the maximum surface it
+/// could ever touch — files outside this union are never read or written.
+pub fn all_default_roots() -> Vec<PathBuf> {
+    use AgentRuntime::*;
+    let runtimes = [Openclaw, ClaudeCode, ClaudeDesktop, Codex];
+    let mut out = Vec::new();
+    for r in runtimes {
+        if let Ok(roots) = default_roots(&r) {
+            for root in roots {
+                if !out.contains(&root) {
+                    out.push(root);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Resolve a path even if it does not yet exist by canonicalizing the longest
 /// existing prefix and reattaching the remainder.
 fn resolve(p: &Path) -> PathBuf {

@@ -18,6 +18,8 @@ use time::OffsetDateTime;
 use tokio::sync::oneshot;
 
 use crate::daemon::allowlist;
+use crate::daemon::cross_runtime_scanner;
+use crate::daemon::recent_index::RecentReleasesIndex;
 use crate::daemon::release::{AgentRuntime, ReleaseEvent};
 use crate::daemon::watcher::watch_for_stop;
 use crate::ledger::{Channel, Ledger, LedgerEntry, ScrubAnchors, SqliteAnchor};
@@ -62,14 +64,28 @@ pub struct Daemon {
     /// hold it across `await` points if the scrub ever becomes async; for
     /// today's blocking `scrub_paths` it's just a critical section.
     scrub_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Recently-released plaintexts (TTL-bounded, in-memory only). Drives
+    /// the cross-runtime scanner; see `daemon::recent_index` for the
+    /// retention policy and `daemon::cross_runtime_scanner` for the
+    /// continuous redaction pass.
+    recent_index: Arc<RecentReleasesIndex>,
 }
 
 impl Daemon {
     pub fn new(ledger: Ledger) -> Self {
+        let scrub_mutex = Arc::new(tokio::sync::Mutex::new(()));
+        let recent_index = Arc::new(RecentReleasesIndex::default());
+        // Spin up the single long-running watcher that redacts cross-
+        // session leaks (e.g. a value released in session A that later
+        // shows up in session B's transcript via a different MCP). The
+        // scanner shares `scrub_mutex` so it doesn't race per-release
+        // scrubs on the same file.
+        cross_runtime_scanner::spawn(Arc::clone(&recent_index), Arc::clone(&scrub_mutex));
         Self {
             ledger,
             open_releases: Arc::new(Mutex::new(HashMap::new())),
-            scrub_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            scrub_mutex,
+            recent_index,
         }
     }
 
@@ -195,6 +211,20 @@ impl Daemon {
             scrub_verified: false,
         };
         self.ledger.insert(&entry).context("ledger insert")?;
+
+        // Register the plaintext with the cross-runtime scanner so it can
+        // redact this value from any *other* transcript on disk for the
+        // configured TTL — closes the leak where a value released in
+        // session A surfaces in session B via a different MCP (chrome
+        // page read, screenshot OCR, etc.). Plaintext stays in memory
+        // only; the ledger row holds the hash, not the plaintext.
+        if let Some(plaintext) = event.value_plaintext.as_ref() {
+            self.recent_index.insert(
+                plaintext.clone(),
+                event.value_hash.clone(),
+                event.release_id.clone(),
+            );
+        }
 
         let needles = build_needles(
             event.value_plaintext.as_deref(),

@@ -41,73 +41,36 @@ Then pick the right flow:
 
 **CRITICAL:** Always combine all L2 items AND all missing items into a SINGLE request. Never create multiple separate requests.
 
-### Rule 3: After creating the request — start background poller and END your response
+### Rule 3: After creating the request — IMMEDIATELY call the matching `rivault_await_*` tool
 
-After creating any auth/form/hybrid request and receiving the API response:
+After creating any auth/hybrid request and receiving the API response:
 
-1. Send the `agentMessage` from the response to the user **word for word**
-2. Start the **background poller** (see section below)
-3. **END your response immediately** — do NOT poll in the foreground, do NOT wait, do NOT add any further text
+1. Send the `agentMessage` from the response to the user **word for word**.
+2. **In the SAME response**, immediately call the matching `rivault_await_*` tool:
+   - `rivault_request_auth` → call `rivault_await_auth` with `auth_request_id` and `item_id`.
+   - `rivault_request_hybrid` → call `rivault_await_hybrid` with `hybrid_request_id`.
+   - `rivault_request_form` → call `rivault_poll_form` in a short loop (form polling is lightweight and doesn't have an await variant).
+3. The `await` tool blocks in-process with internal polling (3-8s backoff, 3 min ceiling) and returns the value as soon as the user approves on their phone. **Do NOT end your response, do NOT spawn a background poller, do NOT wait for a callback message.** Just call the await tool.
 
-**CRITICAL — you MUST follow all three steps above. Common mistakes:**
-- ❌ Polling in a for-loop (gets auto-backgrounded after 10s, you never see the result)
-- ❌ Asking the user to reply when done (defeats the purpose)
-- ❌ Not starting the background poller (session never resumes)
-- ❌ Continuing to write after starting the poller (blocks link delivery on WhatsApp)
+**Common mistakes to avoid:**
+- ❌ Spawning a background bash poller (the previous fragile path — superseded).
+- ❌ Calling `rivault_poll_*` in a manual for-loop (the `await` tool already does this internally).
+- ❌ Asking the user to reply "done" when they approve (the `await` tool detects approval automatically).
+- ❌ Ending your response after `rivault_request_*` (the await tool needs to run in the same response).
 
-#### How to start the background poller
+### Rule 4: Use the value returned by `rivault_await_*` directly
 
-After sending the `agentMessage`, you MUST run the EXACT bash commands below. Only replace the 6 UPPERCASE placeholder values in the `nohup` line. Do NOT write your own polling script. Do NOT modify the extraction command.
+The `rivault_await_*` tool returns the decrypted vault value (or `denied` / `expired` / `timed out`) directly. There are no callbacks; there's no "resume" turn.
 
-**WHY this approach:** The poller script is embedded at the bottom of this file and extracted at runtime. When it detects completion, it delivers TWO separate agent turns with a 30-second gap between them. Turn 1 retrieves the data and confirms to the user ("Data retrieved, task resuming"). Turn 2 completes the original task. The 30s gap ensures OpenClaw flushes the first message to WhatsApp before the second turn arrives, guaranteeing two separate messages. Do NOT write your own polling script or modify the extraction command. Just replace the 6 UPPERCASE placeholders and run it.
+- **On `approved` / `submitted`**: use the value(s) to complete the original task immediately (fill the form, send the request, etc.).
+- **On `denied`**: tell the user you cannot proceed without this data.
+- **On `expired` / `timed out`**: offer to send a fresh authorization link by calling `rivault_request_auth` / `rivault_request_hybrid` again.
 
-```bash
-SESSION_ID=$(cat ~/.openclaw/agents/main/sessions/sessions.json 2>/dev/null | jq -r 'to_entries | sort_by(.value.updatedAt) | last | .value.sessionId // .key // empty')
-RV_POLL="/tmp/rv_poll_$$.sh"
-awk '/^###BEGIN_POLL_SCRIPT###/{f=1;next} /^###END_POLL_SCRIPT###/{f=0} f' ~/.openclaw/skills/rivault/SKILL.md > "$RV_POLL"
-chmod +x "$RV_POLL"
-nohup "$RV_POLL" "REQUEST_TYPE" "URL_TOKEN" "SUCCESS_STATUS" "CALLBACK_TAG" "ID_KEY" "REQUEST_ID" "$SESSION_ID" > /dev/null 2>&1 &
-echo "Poller started"
-```
+After completing the task, run mandatory redaction (Security section) to ensure no plaintext lingers in the transcript.
 
-**CRITICAL:** Do NOT write your own polling script. The extracted script uses two `--deliver` calls separated by a 30-second sleep to guarantee two separate WhatsApp messages. If you write your own script, you WILL break this.
+### Manual fallback (Mode B — bash curl, no JS plugin)
 
-**Placeholder reference table:**
-
-| Request type | RV_TYPE | RV_OK | RV_TAG | RV_KEY |
-|---|---|---|---|---|
-| Auth (L1/L2) | `auth-request` | `approved` | `RIVAULT_APPROVED` | `authRequestId` |
-| Form (missing) | `form-request` | `submitted` | `RIVAULT_FORM_SUBMITTED` | `formRequestId` |
-| Hybrid (mixed) | `hybrid-request` | `submitted` | `RIVAULT_HYBRID_SUBMITTED` | `hybridRequestId` |
-
-**RV_TOKEN**: Extract the last path segment from the URL in the API response (before any `?` query params).
-- `authUrl: "https://example.com/a/abc123def"` → `abc123def`
-- `formUrl: "https://example.com/f/xyz789"` → `xyz789`
-- `hybridUrl: "https://example.com/h/qwe456?return_to=..."` → `qwe456`
-
-**RV_ID**: The `authRequestId`, `formRequestId`, or `hybridRequestId` from the API response.
-
-Then **END your response immediately.**
-
-### Rule 4: Handle callback messages
-
-When the background poller detects completion, it resumes your session with a callback message. Handle each type:
-
-The poller delivers callbacks in two turns, 30 seconds apart. Handle each:
-
-**Turn 1 — Data retrieval** (`[RIVAULT_APPROVED]`, `[RIVAULT_FORM_SUBMITTED]`, or `[RIVAULT_HYBRID_SUBMITTED]`):
-- Extract the request ID from the message
-- Run the appropriate Poll Status API (section 4, 6, or 8) to retrieve the data
-- Say: "✅ Data retrieved, task resuming."
-- **END your response immediately** — do NOT start the task yet. The poller will deliver Turn 2.
-
-**Turn 2 — Task completion** (`[RIVAULT_RESUME]`):
-- Complete the original task using the data you already retrieved in Turn 1
-- Say: "Done! [brief summary]"
-- Run mandatory redaction (Security section)
-
-**`[RIVAULT_DENIED]`** — user denied access:
-- Tell the user you cannot proceed without this data
+If you are running outside the OpenClaw plugin (e.g. direct bash usage), the bash curl flow in sections 3-8 below still works. In that mode, you DO need to poll manually — but for the JS plugin path described above, **always prefer `rivault_await_*`**.
 
 ### CRITICAL: Execute curl via bash — never fabricate responses
 
@@ -248,7 +211,9 @@ echo "$RESP"
 
 **Response:** `{ "authRequestId": "...", "authUrl": "...", "expiresAt": "...", "agentMessage": "..." }`
 
-**After:** Send `agentMessage` to user word for word. Start the background poller (Rule 3). End your response.
+**After (Mode A — JS plugin):** Send `agentMessage` word for word, then immediately call `rivault_await_auth` (Rule 3). The await tool blocks until approval and returns the value.
+
+**After (Mode B — manual bash):** Send `agentMessage` word for word, then poll `/agent/auth-request/$RV_ID/status` every 5-8s until status is no longer `pending`.
 
 ### 4. Poll Auth Status
 
@@ -306,7 +271,9 @@ SESSION_ID=$(cat ~/.openclaw/agents/main/sessions/sessions.json 2>/dev/null | jq
 
 **Response:** `{ "formRequestId": "...", "formUrl": "...", "expiresAt": "...", "agentMessage": "..." }`
 
-**After:** Send `agentMessage` word for word. Start the background poller (Rule 3). End your response.
+**After (Mode A — JS plugin):** Send `agentMessage` word for word, then immediately call the matching `rivault_await_*` tool (Rule 3).
+
+**After (Mode B — manual bash):** Send `agentMessage` word for word, then poll the matching `/status` endpoint every 5-8s.
 
 ### 6. Poll Form Status
 
@@ -361,7 +328,9 @@ Include ALL L2 item IDs in `authItemIds` and ALL missing fields in `formFields`.
 
 **Response:** `{ "hybridRequestId": "...", "hybridUrl": "...", "expiresAt": "...", "agentMessage": "..." }`
 
-**After:** Send `agentMessage` word for word. Start the background poller (Rule 3). End your response.
+**After (Mode A — JS plugin):** Send `agentMessage` word for word, then immediately call the matching `rivault_await_*` tool (Rule 3).
+
+**After (Mode B — manual bash):** Send `agentMessage` word for word, then poll the matching `/status` endpoint every 5-8s.
 
 ### 8. Poll Hybrid Status
 
