@@ -21,7 +21,7 @@ use crate::daemon::allowlist;
 use crate::daemon::cross_runtime_scanner;
 use crate::daemon::recent_index::RecentReleasesIndex;
 use crate::daemon::release::{AgentRuntime, ReleaseEvent};
-use crate::daemon::watcher::watch_for_stop;
+use crate::daemon::watcher::{watch_for_stop, watch_sqlite_for_quiet};
 use crate::ledger::{Channel, Ledger, LedgerEntry, ScrubAnchors, SqliteAnchor};
 use crate::scrubber::{build_needles, scrub_paths, scrub_sqlite_anchors, sqlite as sqlite_scrubber};
 use crate::triggers::HARD_CAP_SECONDS;
@@ -372,6 +372,26 @@ impl Daemon {
             outcome
         };
 
+        // Deferred SQLite scrub: OpenClaw often writes a post-task memory
+        // summary AFTER the stop signal fires, which means those rows land
+        // after the scrub above has already finished. We watch the DB for
+        // write activity to settle, then re-run the SQLite scrubber to catch
+        // any post-stop rows. This runs in the background — the primary
+        // scrub outcome and the ledger mark are not blocked by it.
+        if !anchors.sqlite.is_empty() && !needles.is_empty() {
+            let deferred_anchors = anchors.clone();
+            let deferred_needles = needles.clone();
+            let deferred_release_id = release_id.clone();
+            tokio::spawn(async move {
+                run_deferred_sqlite_scrub(
+                    deferred_anchors,
+                    deferred_needles,
+                    deferred_release_id,
+                )
+                .await;
+            });
+        }
+
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_else(|_| String::new());
@@ -457,6 +477,53 @@ enum ScrubOutcome {
 /// feeds the Scope-2 scrubber so it can redact only the *new* occurrences
 /// and leave pre-release content byte-identical.
 ///
+/// Wait for every SQLite DB in `anchors` to go quiet (no mtime change for
+/// `DEFERRED_QUIET_SECS`), then re-run the SQLite scrubber. This catches
+/// rows that OpenClaw writes after the stop signal fires (e.g. post-task
+/// memory summaries). The anchor's max_rowids snapshot was taken at
+/// release time, so any row written since then — whether during or after
+/// the task — still has rowid > snapshot and will be caught.
+async fn run_deferred_sqlite_scrub(
+    anchors: ScrubAnchors,
+    needles: Vec<String>,
+    release_id: String,
+) {
+    /// Seconds of write inactivity before we consider the DB settled.
+    const DEFERRED_QUIET_SECS: u64 = 10;
+    /// Hard cap: give up and scrub anyway after this many seconds.
+    const DEFERRED_CAP_SECS: u64 = 5 * 60;
+
+    for db_path_str in anchors.sqlite.keys() {
+        let db_path = std::path::PathBuf::from(db_path_str);
+        if !db_path.exists() {
+            continue;
+        }
+        let quiet_rx = watch_sqlite_for_quiet(db_path, DEFERRED_QUIET_SECS, DEFERRED_CAP_SECS);
+        // Await quiet signal (or cap). If the channel dropped (thread
+        // panicked), fall through and scrub anyway.
+        let _ = quiet_rx.await;
+    }
+
+    const LOCK_RETRY_MS: u64 = 5_000;
+    match scrub_sqlite_anchors(&anchors, &needles, LOCK_RETRY_MS) {
+        Ok(r) if r.rows_modified > 0 => {
+            tracing::info!(
+                release_id = %release_id,
+                rows = r.rows_modified,
+                replacements = r.replacements,
+                "deferred post-task sqlite scrub caught post-stop writes",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                release_id = %release_id,
+                "deferred post-task sqlite scrub failed: {e:#}",
+            );
+        }
+    }
+}
+
 /// Walks one level only: the runtime's session dir. Going recursive
 /// across `~/.claude/projects/**` would be expensive on large checkouts;
 /// the Scope-3 ladder (cross-project sweep) is opt-in and lives in the
