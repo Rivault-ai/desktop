@@ -1,7 +1,7 @@
 ---
 name: rivault
-version: 0.2.6
-updatedAt: 2026-05-11T07:00:03Z
+version: 0.2.7
+updatedAt: 2026-05-11T07:15:01Z
 description: "User's encrypted personal vault. MUST be activated for ANY task needing user data: filling forms, signups, logins, purchases, bookings, messages. Provides emails, phone numbers, names, addresses, passwords, API keys, payment info, credentials. Always search vault before asking user for anything."
 metadata:
   { "openclaw": { "emoji": "🔐", "requires": { "env": ["RIVAULT_API_KEY"] }, "primaryEnv": "RIVAULT_API_KEY", "always": true, "priority": "critical", "prerequisite": true, "activateWith": ["*"] } }
