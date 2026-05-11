@@ -68,6 +68,14 @@ text = upsert(text, "updatedAt", stamp)
 with open(path, "w") as f: f.write(text)
 PY
 
+# Mirror the top-level SKILL.md into the nested skills/rivault/SKILL.md.
+# OpenClaw's skill registry indexes the NESTED path
+# (`<location>~/.openclaw/skills/rivault/skills/rivault/SKILL.md</location>`)
+# so the agent reads the nested file, not the top-level one. Keeping them
+# in sync at every bump avoids the failure mode where prompt updates
+# silently never reach the agent because only the top-level got updated.
+cp "$SKILL_MD" "$ROOT/skills/rivault/SKILL.md"
+
 python3 - "$PKG_JSON" "$NEW" <<'PY'
 import json, sys
 path, new_ver = sys.argv[1], sys.argv[2]
