@@ -318,3 +318,41 @@ button.link:hover {
   border-radius: 3px;
   font-size: 10px;
 }
+
+/* Build info footer — small, muted; identifies the running build. */
+.build-footer {
+  margin: 24px 0 4px;
+  padding: 8px 0;
+  border-top: 1px solid #1f2937;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: #6b7280;
+  cursor: pointer;
+  user-select: none;
+  transition: color 120ms ease;
+}
+
+.build-footer:hover {
+  color: #9ca3af;
+}
+
+.build-footer .build-version {
+  font-weight: 600;
+  color: #9ca3af;
+}
+
+.build-footer .build-sep {
+  color: #374151;
+}
+
+.build-footer .build-sha {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.build-footer .build-copied {
+  margin-left: auto;
+  font-size: 10px;
+  color: #16a34a;
+}
