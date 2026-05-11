@@ -60,6 +60,14 @@ impl Keypair {
     /// Generate a fresh P-256 keypair using the OS CSPRNG.
     pub fn generate() -> Result<Self> {
         let secret = SecretKey::random(&mut OsRng);
+        Self::from_secret(secret)
+    }
+
+    /// Rehydrate a [`Keypair`] from a secret recovered from persistent
+    /// storage. Re-derives the cached SPKI DER so callers don't need to
+    /// also store it. Used by `KeypairStore::take` when loading a row
+    /// after a daemon restart.
+    pub fn from_secret(secret: SecretKey) -> Result<Self> {
         let der = secret
             .public_key()
             .to_public_key_der()
