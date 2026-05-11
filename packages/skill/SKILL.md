@@ -1,7 +1,7 @@
 ---
 name: rivault
-version: 0.2.4
-updatedAt: 2026-05-11T06:17:24Z
+version: 0.2.5
+updatedAt: 2026-05-11T06:40:53Z
 description: "User's encrypted personal vault. MUST be activated for ANY task needing user data: filling forms, signups, logins, purchases, bookings, messages. Provides emails, phone numbers, names, addresses, passwords, API keys, payment info, credentials. Always search vault before asking user for anything."
 metadata:
   { "openclaw": { "emoji": "🔐", "requires": { "env": ["RIVAULT_API_KEY"] }, "primaryEnv": "RIVAULT_API_KEY", "always": true, "priority": "critical", "prerequisite": true, "activateWith": ["*"] } }
@@ -72,14 +72,25 @@ After calling any `rivault_request_auth` / `rivault_request_hybrid` and getting 
 - ❌ Looping or sleeping in bash inside the agent turn — same blocking problem.
 - ❌ Adding any text after the `agentMessage` — OpenClaw concatenates all output into one WhatsApp message, which the user then sees AFTER approval instead of before.
 
-### Rule 4: Handle the resume callback in the next turn
+### Rule 4: Handle the resume callbacks in NEW turns
 
-When the user approves, the background poller resumes your session with a system message. You'll see it as the next user-role input. Handle each tag:
+The background poller resumes your session with a system message when it detects approval. **Two-step delivery**: you get a NOTIFY callback first (so the user sees "✅ Authorization complete" right away in WhatsApp), then ~4s later a SUBMITTED callback with the actual work. Each callback lands in a separate turn — handle one at a time and END your response immediately so OpenClaw flushes to WhatsApp between turns.
 
-- **`[RIVAULT_APPROVED] authRequestId=<id> itemId=<id>`** — call `rivault_poll_auth` with the IDs to retrieve the decrypted value, complete the task, run redaction (Security section), end response.
-- **`[RIVAULT_HYBRID_SUBMITTED] hybridRequestId=<id>`** — call `rivault_poll_hybrid`, complete the task, run redaction, end response.
-- **`[RIVAULT_FORM_SUBMITTED] formRequestId=<id>`** — call `rivault_poll_form` to get the new `itemId`, then `rivault_get_secret` (L1) or `rivault_request_auth` (L2) to retrieve, complete the task, redact.
-- **`[RIVAULT_DENIED]`** — tell the user you cannot proceed without this data, end response.
+**Quick-notify callbacks** — send a single user-facing message and end the turn. Do NOT call any tools yet.
+
+- **`[RIVAULT_APPROVED_NOTIFY]`** → send: `"✅ Authorization complete — retrieving now."` and END.
+- **`[RIVAULT_HYBRID_NOTIFY] ...`** → send: `"✅ Authorization complete — filling the form now."` and END. (The callback message includes the exact text to send.)
+
+**Work callbacks** — retrieve, complete the task, redact, end.
+
+- **`[RIVAULT_APPROVED] authRequestId=<id> itemId=<id>`** → call `rivault_poll_auth` with the IDs to retrieve the decrypted value, complete the task, run redaction (Security section), tell the user "Done — [one sentence summary]", end.
+- **`[RIVAULT_HYBRID_SUBMITTED] hybridRequestId=<id>`** → call `rivault_poll_hybrid`, complete the task, run redaction, tell the user "Done — [one sentence summary]", end.
+- **`[RIVAULT_FORM_SUBMITTED] formRequestId=<id>`** → call `rivault_poll_form` to get the new `itemId`, then `rivault_get_secret` (L1) or `rivault_request_auth` (L2) to retrieve, complete the task, redact, "Done — …", end.
+
+**Failure callbacks**
+
+- **`[RIVAULT_DENIED]`** — tell the user you cannot proceed without this data, end.
+- **`[RIVAULT_HYBRID_EXPIRED]` / `[RIVAULT_AUTH_EXPIRED]`** — tell the user the link expired, offer to send a fresh one by calling `rivault_request_*` again with the same item ids.
 
 ### Manual fallback (Mode B — bash curl, no JS plugin)
 
