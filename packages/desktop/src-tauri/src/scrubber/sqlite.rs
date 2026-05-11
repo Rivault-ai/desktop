@@ -181,13 +181,48 @@ pub fn scrub_anchor(
 // ---- helpers --------------------------------------------------------------
 
 fn list_user_tables(conn: &Connection) -> Result<Vec<String>> {
+    // Fetch every non-system table with its CREATE SQL so we can
+    // identify virtual tables (FTS5, FTS4, rtree, …).
     let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .prepare(
+            "SELECT name, COALESCE(sql, '') FROM sqlite_schema \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
         .context("prepare list_user_tables")?;
-    let names = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+    let all: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(names)
+
+    // FTS5/FTS4/rtree tables created with CREATE VIRTUAL TABLE.
+    // We must NOT try to UPDATE these directly — the FTS engine
+    // manages them internally and rejects direct writes.
+    let virtual_names: std::collections::HashSet<String> = all
+        .iter()
+        .filter(|(_, sql)| sql.to_ascii_uppercase().starts_with("CREATE VIRTUAL TABLE"))
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    // FTS5 shadow tables follow the pattern `<vt>_data`, `<vt>_idx`,
+    // `<vt>_content`, `<vt>_docsize`, `<vt>_config`. Modifying these
+    // would silently corrupt the FTS index. Skip them too.
+    let shadow_suffixes = ["_data", "_idx", "_content", "_docsize", "_config"];
+
+    Ok(all
+        .into_iter()
+        .filter_map(|(name, _)| {
+            if virtual_names.contains(&name) {
+                return None;
+            }
+            for vt in &virtual_names {
+                for suffix in &shadow_suffixes {
+                    if name == format!("{}{}", vt, suffix) {
+                        return None;
+                    }
+                }
+            }
+            Some(name)
+        })
+        .collect())
 }
 
 fn text_or_blob_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
@@ -441,6 +476,53 @@ mod tests {
         assert!(
             !tables.iter().any(|t| t.starts_with("sqlite_")),
             "internal tables must be filtered: {tables:?}"
+        );
+    }
+
+    #[test]
+    fn skips_fts5_virtual_and_shadow_tables() {
+        // Mirrors OpenClaw's actual memory schema: an FTS5 virtual table
+        // over `chunks`. The scrubber must leave the FTS5 infrastructure
+        // alone (direct UPDATE would fail) and only scrub the plain
+        // `chunks` table, which holds the original text.
+        let p = tmp_db("fts5.sqlite");
+        let conn = Connection::open(&p).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chunks (id INTEGER PRIMARY KEY, body TEXT);
+             CREATE VIRTUAL TABLE chunks_fts USING fts5(body, content='chunks', content_rowid='id');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks (body) VALUES ('pre-existing chunk with token-xyz')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let anchor = snapshot_anchor(&p).unwrap().unwrap();
+        // Snapshot should include chunks but not chunks_fts or its shadows.
+        assert!(anchor.max_rowids.contains_key("chunks"));
+        assert!(!anchor.max_rowids.contains_key("chunks_fts"));
+        assert!(!anchor.max_rowids.contains_key("chunks_fts_data"));
+
+        let conn = Connection::open(&p).unwrap();
+        conn.execute(
+            "INSERT INTO chunks (body) VALUES ('task chunk with token-xyz exposed')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Must not error even though chunks_fts shadow tables exist.
+        let report =
+            scrub_anchor(&p, &anchor, &["token-xyz".to_string()], 5_000).unwrap();
+        assert_eq!(report.rows_modified, 1, "exactly the task-window row in chunks");
+
+        let conn = Connection::open(&p).unwrap();
+        assert_eq!(
+            count_in_col(&conn, "chunks", "body", "token-xyz"),
+            1,
+            "pre-existing row stays intact"
         );
     }
 
