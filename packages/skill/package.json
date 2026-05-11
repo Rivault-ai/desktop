@@ -1,6 +1,6 @@
 {
   "name": "rivault",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Rivault secure vault skill for OpenClaw \u2014 lets AI agents securely access user secrets with authorization",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

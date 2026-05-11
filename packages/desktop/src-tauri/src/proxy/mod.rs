@@ -70,9 +70,19 @@ pub struct ProxyState {
     backend: Arc<str>,
     http: Client,
     /// Stores ephemeral private keys minted on L2 create-request paths,
-    /// keyed by the upstream-issued request id. Decrypts on the matching
-    /// `/status` poll, then drops the keypair (one-shot).
+    /// keyed by the upstream-issued request id. `take()` is now
+    /// non-destructive: retries of `rivault_poll_hybrid` after a timeout
+    /// still decrypt successfully.
     keypairs: KeypairStore,
+    /// `(hybrid_request_id, value_hash)` pairs that have already been
+    /// logged to the ledger. Multiple polls of the same hybrid (because
+    /// `take()` is non-destructive) decrypt the same envelopes again
+    /// and again — without this guard we'd log duplicate release rows
+    /// on every retry. The set is in-memory (cleared on daemon restart);
+    /// after a restart, the worst case is one duplicate row per
+    /// hybrid-item, far less noisy than the 6-row burst that motivated
+    /// this dedup.
+    logged_releases: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ProxyState {
@@ -94,6 +104,9 @@ impl ProxyState {
             backend: backend.into(),
             http,
             keypairs: KeypairStore::new(),
+            logged_releases: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         })
     }
 }
@@ -279,10 +292,26 @@ fn build_axum_response(
 ) -> axum::response::Response {
     let mut builder = axum::http::Response::builder().status(status);
     for (k, v) in headers.iter() {
-        if is_hop_by_hop(k.as_str()) {
+        let name = k.as_str();
+        if is_hop_by_hop(name) {
             continue;
         }
-        builder = builder.header(k.as_str(), v.as_bytes());
+        // Strip Content-Length and Content-Encoding from the upstream
+        // response. We've decrypted envelopes / rewritten JSON in place
+        // so the upstream-declared byte count no longer matches what
+        // we're about to send. Without this strip, an upstream that
+        // returned 82 bytes (envelope JSON) followed by our 80-byte
+        // decrypted rewrite causes the client to wait for 2 extra
+        // bytes that never arrive — which is exactly what made every
+        // `rivault_poll_hybrid` time out at 15s. Axum/hyper will set a
+        // fresh Content-Length on the way out based on what we
+        // actually send.
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("content-encoding")
+        {
+            continue;
+        }
+        builder = builder.header(name, v.as_bytes());
     }
     builder
         .body(Body::from(body))
@@ -323,8 +352,21 @@ fn log_release(
     plaintext: &str,
     item_id_or_session: &str,
 ) -> Result<()> {
-    let release_id = uuid::Uuid::new_v4().to_string();
     let value_hash = hex::encode(Sha256::digest(plaintext.as_bytes()));
+    // Dedup: a single hybrid request can be polled multiple times (the
+    // skill plugin retries on timeout, and the keypair store is now
+    // non-destructive). Each poll re-runs `transform_hybrid_status`
+    // and would otherwise log a fresh release row for every envelope
+    // every time. Track `(scope, value_hash)` pairs so we only log
+    // the first successful decrypt per item, not the Nth.
+    let dedup_key = format!("{item_id_or_session}|{value_hash}");
+    {
+        let mut seen = state.logged_releases.lock().unwrap();
+        if !seen.insert(dedup_key) {
+            return Ok(()); // already logged — skip the duplicate
+        }
+    }
+    let release_id = uuid::Uuid::new_v4().to_string();
     let transcript_paths = resolve_transcript_paths(&state.runtime);
     let released_at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)

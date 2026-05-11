@@ -23,27 +23,30 @@ const POLL_INTERVAL_MAX_MS = 8_000
 const BACKOFF_AFTER_POLLS = 10
 const MAX_ATTEMPTS = 200 // ~22 minutes at mixed intervals
 
-async function resumeAgent(message: string): Promise<void> {
-  try {
-    await execFileAsync('openclaw', [
-      'agent',
-      '--session-id', sessionId,
-      '--message', message,
-      '--deliver',
-    ])
-  } catch (err) {
-    // If --session-id fails, try without it (falls back to most recent session)
+async function resumeAgent(message: string): Promise<boolean> {
+  // 3 attempts × 2 transports (session-id, channel=last) × 2s backoff.
+  // `openclaw agent --deliver` is sometimes flaky after gateway restarts;
+  // retrying handles transient IPC failures gracefully.
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      await execFileAsync('openclaw', [
-        'agent',
-        '--channel', 'last',
-        '--message', message,
-        '--deliver',
+      await execFileAsync('/opt/homebrew/bin/openclaw', [
+        'agent', '--session-id', sessionId, '--message', message, '--deliver',
       ])
+      return true
     } catch {
-      // Nothing more we can do
+      try {
+        await execFileAsync('/opt/homebrew/bin/openclaw', [
+          'agent', '--channel', 'last', '--message', message, '--deliver',
+        ])
+        return true
+      } catch {
+        if (attempt < 3) {
+          await new Promise(resolve => setTimeout(resolve, 2_000))
+        }
+      }
     }
   }
+  return false
 }
 
 async function poll(): Promise<void> {
