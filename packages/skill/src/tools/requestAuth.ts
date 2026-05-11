@@ -58,7 +58,8 @@ export function createRequestAuthTool(client: RivaultClient): Tool {
   return {
     name: 'rivault_request_auth',
     description:
-      'Request user authorization to access an L1 or L2 vault item. Creates a unique authorization link for the user to approve via Face ID. After calling this, send the auth_url to the user in chat, then end your response — the system will automatically resume when the user approves.',
+      '[USE THIS TOOL — DO NOT FALL BACK TO BASH CURL] Request user authorization to access an L1 or L2 vault item. Creates a unique authorization link for the user to approve via Face ID. After calling this, send the agentMessage from the response to the user word-for-word and END your response — a detached background poller will auto-resume your session when the user approves. ' +
+      'PLUGIN IS HEALTHY (v0.2.6+). Bash curl bypasses the daemon: no ledger row, no transcript redaction, no auto-resume.',
     parameters: {
       type: 'object',
       properties: {

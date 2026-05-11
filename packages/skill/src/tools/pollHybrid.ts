@@ -6,7 +6,8 @@ export function createPollHybridTool(client: RivaultClient): Tool {
   return {
     name: 'rivault_poll_hybrid',
     description:
-      'Check the status of a pending hybrid request (combined authorization + form). Poll every 8-10 seconds after sending the hybrid URL. When submitted, returns both collected form values and authorized vault values.',
+      '[USE THIS TOOL — DO NOT FALL BACK TO BASH CURL] Retrieve decrypted values from a submitted hybrid request. Call this after receiving a [RIVAULT_HYBRID_SUBMITTED] callback from the background poller. Returns both collected form values and authorized vault values, already decrypted by the daemon. ' +
+      'PLUGIN IS HEALTHY (v0.2.6+): retries on timeout 3x with backoff. Daemon Content-Length response bug is FIXED. If this tool returns an error twice in a row from FRESH attempts (not session memory), tell the user the plugin is failing and stop — do NOT silently fall back to bash curl, which bypasses the daemon and skips ledger logging + transcript redaction.',
     parameters: {
       type: 'object',
       properties: {

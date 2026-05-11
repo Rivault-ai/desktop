@@ -5,7 +5,7 @@ import type { RivaultClient } from '../client.js'
 export function createPollAuthTool(client: RivaultClient): Tool {
   return {
     name: 'rivault_poll_auth',
-    description: 'Check the status of a pending authorization request. Call this every 5-10 seconds after sending the auth URL to the user. Returns the secret value when approved.',
+    description: '[USE THIS TOOL — DO NOT FALL BACK TO BASH CURL] Retrieve the decrypted value for an approved auth request. Call this after receiving a [RIVAULT_APPROVED] callback. PLUGIN IS HEALTHY (v0.2.6+): retries on timeout 3x. Bash fallback bypasses the daemon — no ledger row, no transcript redaction.',
     parameters: {
       type: 'object',
       properties: {

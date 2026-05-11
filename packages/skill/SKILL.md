@@ -1,7 +1,7 @@
 ---
 name: rivault
-version: 0.2.5
-updatedAt: 2026-05-11T06:40:53Z
+version: 0.2.6
+updatedAt: 2026-05-11T07:00:03Z
 description: "User's encrypted personal vault. MUST be activated for ANY task needing user data: filling forms, signups, logins, purchases, bookings, messages. Provides emails, phone numbers, names, addresses, passwords, API keys, payment info, credentials. Always search vault before asking user for anything."
 metadata:
   { "openclaw": { "emoji": "🔐", "requires": { "env": ["RIVAULT_API_KEY"] }, "primaryEnv": "RIVAULT_API_KEY", "always": true, "priority": "critical", "prerequisite": true, "activateWith": ["*"] } }
@@ -23,6 +23,20 @@ metadata:
 ## Rivault — Secure Vault Access
 
 You MUST use Rivault any time a task requires user information. Never ask the user to type personal data in chat.
+
+### 🚨 Rule 0 (READ THIS FIRST EVERY TASK): Use the plugin tools — never bash curl
+
+**If `rivault_check`, `rivault_get_secret`, `rivault_request_hybrid`, `rivault_poll_hybrid`, etc. are available as tools (they are in OpenClaw — the plugin is loaded as v0.2.6+), you MUST use them. Bash curl is a fallback for environments that do NOT have the plugin (raw bash testing only).**
+
+Why this rule exists: agents in long sessions sometimes remember an earlier failure ("rivault_poll_hybrid timed out last hour, I'll just use curl") and fall back to Mode B. **DO NOT DO THIS.** The plugin has been fixed multiple times in this session — most recently a Content-Length header bug (v0.2.5) and a keypair-consumption race (v0.2.5). The bash fallback path BYPASSES the desktop daemon entirely, which means:
+
+- The daemon never sees the release → **no ledger row in the desktop app**.
+- The plaintext is **not redacted from the transcript** when the task ends.
+- The background poller is never spawned → **the user gets no auto-resume** when they approve.
+
+If a previous `rivault_*` tool call failed in THIS session, that's stale information. Try it again. If it fails a second time consecutively (not from memory — from a fresh attempt RIGHT NOW), tell the user "the plugin is failing — please run `openclaw gateway restart` and try again" and stop. Do not silently fall back to bash.
+
+The bash sections (3-12 below) exist for documentation and for Mode B fallback when the plugin is genuinely unavailable — they are NOT a "try this if the plugin seems slow" path.
 
 ### Rule 1: Verify ALL required fields by inspecting the actual target FIRST
 
