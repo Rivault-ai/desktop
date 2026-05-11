@@ -90,7 +90,8 @@ pub struct ScrubReport {
     pub scope_used: Option<ScopeUsed>,
 }
 
-/// Scrub the given paths.
+/// Scrub the given paths, retrying until verified or the hard-cap
+/// deadline elapses.
 ///
 /// `anchors.files` records the file size at the moment the release was
 /// accepted. We scrub only bytes written *after* that offset — the task
@@ -101,64 +102,109 @@ pub struct ScrubReport {
 /// `anchors.sqlite` is consumed by the SQLite memory scrubber wired in a
 /// later commit; this entry point ignores it for now.
 ///
-/// Three integrity checks before we overwrite:
+/// Retry-until-clean: each pass runs Scope 1 (offset-anchored on the
+/// primary transcript) + Scope 2 (precount-aware whole-file rewrite on
+/// every file in `files_precount`, which now includes the primary), then
+/// verifies. If verify is still dirty we sleep with exponential backoff
+/// and try again, up to `HARD_CAP_SECONDS` (15 min) total. The reason
+/// for retry: when the agent is still actively writing the plaintext to
+/// the transcript at the moment of the first scrub, residue can re-appear
+/// between rewrite and verify — looping handles this race. After the
+/// deadline the release is marked unverified so the operator can see the
+/// scrub didn't fully settle.
+///
+/// Three integrity checks during each pass:
 /// 1. File still UTF-8 (skip if binary now)
 /// 2. Current size >= stored offset (otherwise the file was truncated/
 ///    rotated underneath us — fall back to full-file scrub on the new file
 ///    since we have no idea where the task-window suffix begins)
-/// 3. Verify pass after rewrite confirms no needle remains anywhere in the
-///    suffix; if any does, the report is marked unverified and the
-///    orchestrator can enqueue rotation.
+/// 3. Verify pass after rewrite confirms no needle remains in the
+///    suffix and no sibling file has more occurrences than its precount.
 pub fn scrub_paths(
     paths: &[String],
     needles: &[String],
     anchors: &ScrubAnchors,
 ) -> Result<ScrubReport> {
+    scrub_paths_until(
+        paths,
+        needles,
+        anchors,
+        std::time::Duration::from_secs(15 * 60), // mirror HARD_CAP_SECONDS
+    )
+}
+
+/// Same as [`scrub_paths`] but with a caller-supplied deadline. Exposed
+/// for tests so the deadline-exhaustion path can be exercised quickly.
+pub fn scrub_paths_until(
+    paths: &[String],
+    needles: &[String],
+    anchors: &ScrubAnchors,
+    budget: std::time::Duration,
+) -> Result<ScrubReport> {
     if needles.is_empty() {
         return Err(anyhow!("no needles to scrub"));
     }
-    let mut report = ScrubReport::default();
-
-    // Scope 1: targeted byte-offset scrub on the primary transcript paths.
-    // This is the cheap, deterministic happy path — most releases settle
-    // here and never escalate.
+    let deadline = std::time::Instant::now() + budget;
     let offsets = &anchors.files;
-    for p in paths {
-        let path = Path::new(p);
-        if !path.exists() {
-            continue;
+    let mut report = ScrubReport::default();
+    let mut attempt: u32 = 0;
+    let mut backoff = std::time::Duration::from_millis(100);
+    let backoff_cap = std::time::Duration::from_secs(5);
+
+    loop {
+        attempt += 1;
+
+        // Each pass: Scope 1 on the primary paths (targeted, offset-
+        // anchored) then Scope 2 on every precounted file (which now
+        // includes the primary via `precount_runtime_siblings`).
+        for p in paths {
+            let path = Path::new(p);
+            if !path.exists() {
+                continue;
+            }
+            if path.is_dir() {
+                scrub_dir(path, needles, offsets, &mut report)?;
+            } else {
+                let start = offsets.get(p).copied().unwrap_or(0);
+                scrub_one(path, needles, start, &mut report)?;
+            }
         }
-        if path.is_dir() {
-            scrub_dir(path, needles, offsets, &mut report)?;
-        } else {
-            let start = offsets.get(p).copied().unwrap_or(0);
-            scrub_one(path, needles, start, &mut report)?;
+        if !anchors.files_precount.is_empty() {
+            scrub_runtime_wide(needles, &anchors.files_precount, &mut report)?;
+            report.scope_used = Some(ScopeUsed::RuntimeWide);
+        } else if report.scope_used.is_none() {
+            report.scope_used = Some(ScopeUsed::Targeted);
         }
-    }
-    report.scope_used = Some(ScopeUsed::Targeted);
 
-    // Verify on TWO surfaces, not just the primary paths:
-    //   - the primary paths' in-window suffix (Scope-1 territory),
-    //   - the pre-counted siblings (Scope-2 territory; current count
-    //     must equal pre count or there's residue we missed).
-    // If either surface has residue, escalate to Scope 2.
-    let scope_1_primary_ok = verify(paths, needles, offsets)?;
-    let scope_1_siblings_ok = verify_with_precounts(needles, &anchors.files_precount)?;
-    if scope_1_primary_ok && scope_1_siblings_ok {
-        report.verified = true;
-        return Ok(report);
-    }
+        // Verify both surfaces.
+        let primary_ok = verify(paths, needles, offsets)?;
+        let siblings_ok = verify_with_precounts(needles, &anchors.files_precount)?;
+        if primary_ok && siblings_ok {
+            report.verified = true;
+            tracing::debug!(
+                attempt,
+                "scrub verified clean",
+            );
+            return Ok(report);
+        }
 
-    if !anchors.files_precount.is_empty() {
-        scrub_runtime_wide(needles, &anchors.files_precount, &mut report)?;
-        report.scope_used = Some(ScopeUsed::RuntimeWide);
-        report.verified = verify_with_precounts(needles, &anchors.files_precount)?
-            && verify(paths, needles, offsets)?;
-    } else {
-        report.verified = false;
-    }
+        if std::time::Instant::now() >= deadline {
+            // Deadline hit. Surface the unverified state; the orchestrator
+            // will mark the ledger row so the user sees it.
+            report.verified = false;
+            tracing::warn!(
+                attempt,
+                "scrub hit hard-cap deadline with residue still present"
+            );
+            return Ok(report);
+        }
 
-    Ok(report)
+        // Brief pause before retry so a still-writing agent has a chance
+        // to flush before we redact again. Exponential backoff caps at
+        // 5s so the loop converges quickly when the writer is idle.
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(backoff_cap);
+    }
 }
 
 /// Cross-runtime, anchor-free scrub used by the continuous scanner.
@@ -558,6 +604,54 @@ mod tests {
             .unwrap();
         assert!(r.verified);
         assert!(r.files_modified.is_empty());
+    }
+
+    #[test]
+    fn retries_then_succeeds_when_writer_is_idle() {
+        // Smoke test: deadline-budgeted scrub_paths_until returns the
+        // same verified=true outcome on a normal one-pass-clean case.
+        // The retry loop's value shows up on concurrent-writer cases
+        // which are hard to deterministically simulate in a unit test —
+        // those are covered manually in integration.
+        let p = tmpfile("retry_clean.jsonl", "before secret@x.com after");
+        let needles = build_needles(Some("secret@x.com"), &[]);
+        let r = scrub_paths_until(
+            &[p.display().to_string()],
+            &needles,
+            &no_anchors(),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(r.verified, "single-pass-clean must return verified");
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(!after.contains("secret@x.com"));
+        assert!(after.contains(REDACTION_MARKER));
+    }
+
+    #[test]
+    fn deadline_zero_returns_after_one_pass() {
+        // Deadline already-elapsed-at-call: one pass runs (Scope-1 +
+        // optional Scope-2), then the loop checks the deadline,
+        // returns. Verifies the loop doesn't infinite-spin and the
+        // first pass is always run regardless of budget.
+        let p = tmpfile("zerod.jsonl", "alpha secret@x.com omega");
+        let needles = build_needles(Some("secret@x.com"), &[]);
+        let started = std::time::Instant::now();
+        let r = scrub_paths_until(
+            &[p.display().to_string()],
+            &needles,
+            &no_anchors(),
+            std::time::Duration::from_millis(0),
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(r.verified, "single pass on idle file should verify clean");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "should not block on a 0ms deadline"
+        );
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(after.contains(REDACTION_MARKER));
     }
 
     #[test]
