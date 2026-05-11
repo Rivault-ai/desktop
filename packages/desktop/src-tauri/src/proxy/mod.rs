@@ -135,21 +135,27 @@ pub fn router(state: ProxyState) -> Router {
             "/agent/hybrid-request/:hybrid_request_id/status",
             get(forward_hybrid_status),
         )
-        // Catch-all for everything else under /agent/* (form-request,
-        // login-request, anything new the backend ships).
-        .route("/agent/*rest", any(forward_passthrough))
         // Public token-based status endpoints used by the OpenClaw
         // skill plugin's detached background poller. These hit the
         // public (unauthenticated) Rivault API to check whether the
         // user has approved an auth/hybrid/login/form request without
-        // consuming Redis values. Without these routes the daemon
-        // returns 404 and the poller silently polls forever, missing
-        // approval. Pure passthrough — no plaintext crosses these
-        // endpoints, just status strings.
+        // consuming Redis values. Pure passthrough — no plaintext
+        // crosses these endpoints, just status strings.
+        //
+        // ORDER MATTERS: these MUST be registered BEFORE the
+        // `/agent/*rest` wildcard. With axum 0.7's matchit-based router,
+        // a wildcard route registered earlier in the chain blocks
+        // sibling-segment matchers that follow. Without this ordering
+        // the routes silently 404 even though `strings <binary>` shows
+        // them present.
         .route("/auth-request/:token", get(forward_passthrough))
         .route("/hybrid-request/:token", get(forward_passthrough))
         .route("/form-request/:token", get(forward_passthrough))
         .route("/login-request/:token", get(forward_passthrough))
+        // Catch-all for everything else under /agent/* (form-request,
+        // login-request, anything new the backend ships). MUST come
+        // LAST among the proxy's routes — see the comment block above.
+        .route("/agent/*rest", any(forward_passthrough))
         .with_state(s)
 }
 
