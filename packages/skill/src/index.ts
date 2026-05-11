@@ -3,14 +3,23 @@ import { createSearchTool } from './tools/search.js'
 import { createGetSecretTool } from './tools/getSecret.js'
 import { createRequestAuthTool } from './tools/requestAuth.js'
 import { createPollAuthTool } from './tools/pollAuth.js'
-import { createAwaitAuthTool } from './tools/awaitAuth.js'
 import { createRequestFormTool } from './tools/requestForm.js'
 import { createPollFormTool } from './tools/pollForm.js'
 import { createRequestHybridTool } from './tools/requestHybrid.js'
 import { createPollHybridTool } from './tools/pollHybrid.js'
-import { createAwaitHybridTool } from './tools/awaitHybrid.js'
 import type { Tool } from './tools/types.js'
 import { validateConfig, config } from './config.js'
+
+// NOTE: there are no `rivault_await_*` tools in the JS plugin on
+// purpose. OpenClaw delivers an agent's response to the user as a
+// single message at the END of the turn — any tool that blocks for
+// minutes inside the turn (waiting for the user to approve on their
+// phone) also blocks the auth URL from reaching the user, deadlocking
+// the flow. Use the subprocess-poller + end-the-turn pattern instead
+// (handled inside `requestAuth.ts` / `requestHybrid.ts`). The daemon's
+// MCP server still hosts `rivault_await_*` for runtimes whose tool
+// calls do NOT block user-visible text (Claude Code, Codex, etc.) —
+// see `packages/desktop/src-tauri/src/mcp/server.rs`.
 
 export type { Tool, ToolResult } from './tools/types.js'
 export type {
@@ -48,12 +57,10 @@ export const skill = {
       createGetSecretTool(client),
       createRequestAuthTool(client),
       createPollAuthTool(client),
-      createAwaitAuthTool(client),
       createRequestFormTool(client),
       createPollFormTool(client),
       createRequestHybridTool(client),
       createPollHybridTool(client),
-      createAwaitHybridTool(client),
     ]
   },
 
@@ -111,12 +118,10 @@ export default function register(api: OpenClawApi): void {
     createGetSecretTool,
     createRequestAuthTool,
     createPollAuthTool,
-    createAwaitAuthTool,
     createRequestFormTool,
     createPollFormTool,
     createRequestHybridTool,
     createPollHybridTool,
-    createAwaitHybridTool,
   ]
 
   // Build tool metadata from a throwaway client (key/URL don't matter here,

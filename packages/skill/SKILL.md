@@ -1,7 +1,7 @@
 ---
 name: rivault
-version: 0.2.2
-updatedAt: 2026-05-11T03:55:00Z
+version: 0.2.3
+updatedAt: 2026-05-11T04:08:56Z
 description: "User's encrypted personal vault. MUST be activated for ANY task needing user data: filling forms, signups, logins, purchases, bookings, messages. Provides emails, phone numbers, names, addresses, passwords, API keys, payment info, credentials. Always search vault before asking user for anything."
 metadata:
   { "openclaw": { "emoji": "🔐", "requires": { "env": ["RIVAULT_API_KEY"] }, "primaryEnv": "RIVAULT_API_KEY", "always": true, "priority": "critical", "prerequisite": true, "activateWith": ["*"] } }
@@ -56,36 +56,34 @@ Then pick the right flow:
 
 **CRITICAL:** Always combine all L2 items AND all missing items into a SINGLE request. Never create multiple separate requests.
 
-### Rule 3: After creating the request — IMMEDIATELY call the matching `rivault_await_*` tool
+### Rule 3: After creating the request — send the URL, END your response
 
-After creating any auth/hybrid request and receiving the API response:
+OpenClaw flushes the agent's text output to the user as a single message at the **end of the turn**. Any tool call that blocks for minutes inside the turn (e.g. waiting for the user to approve on their phone) also blocks the auth URL from reaching the user — they'd see nothing for the entire timeout and the flow deadlocks. That is why the JS plugin does **not** expose any `rivault_await_*` tools.
 
-1. Send the `agentMessage` from the response to the user **word for word**.
-2. **In the SAME response**, immediately call the matching `rivault_await_*` tool:
-   - `rivault_request_auth` → call `rivault_await_auth` with `auth_request_id` and `item_id`.
-   - `rivault_request_hybrid` → call `rivault_await_hybrid` with `hybrid_request_id`.
-   - `rivault_request_form` → call `rivault_poll_form` in a short loop (form polling is lightweight and doesn't have an await variant).
-3. The `await` tool blocks in-process with internal polling (3-8s backoff, 3 min ceiling) and returns the value as soon as the user approves on their phone. **Do NOT end your response, do NOT spawn a background poller, do NOT wait for a callback message.** Just call the await tool.
+After calling any `rivault_request_auth` / `rivault_request_hybrid` and getting the API response:
+
+1. Send the `agentMessage` from the response to the user **word for word**. The user must see the auth URL right now.
+2. **END your response immediately.** Do NOT call any more tools. Do NOT manually poll. Do NOT ask the user to reply when they approve.
+3. The `request_*` tool has already spawned a detached background poller. When the user approves on their phone, the poller calls `openclaw agent --deliver` and resumes this session in a NEW turn with a `[RIVAULT_APPROVED]` (or `[RIVAULT_HYBRID_SUBMITTED]`) message containing the request ID.
 
 **Common mistakes to avoid:**
-- ❌ Spawning a background bash poller (the previous fragile path — superseded).
-- ❌ Calling `rivault_poll_*` in a manual for-loop (the `await` tool already does this internally).
-- ❌ Asking the user to reply "done" when they approve (the `await` tool detects approval automatically).
-- ❌ Ending your response after `rivault_request_*` (the await tool needs to run in the same response).
+- ❌ Calling `rivault_poll_*` (or any other tool) in the same response — blocks the URL from being delivered to the user.
+- ❌ Asking the user to reply "done" when they approve — the poller resumes automatically.
+- ❌ Looping or sleeping in bash inside the agent turn — same blocking problem.
+- ❌ Adding any text after the `agentMessage` — OpenClaw concatenates all output into one WhatsApp message, which the user then sees AFTER approval instead of before.
 
-### Rule 4: Use the value returned by `rivault_await_*` directly
+### Rule 4: Handle the resume callback in the next turn
 
-The `rivault_await_*` tool returns the decrypted vault value (or `denied` / `expired` / `timed out`) directly. There are no callbacks; there's no "resume" turn.
+When the user approves, the background poller resumes your session with a system message. You'll see it as the next user-role input. Handle each tag:
 
-- **On `approved` / `submitted`**: use the value(s) to complete the original task immediately (fill the form, send the request, etc.).
-- **On `denied`**: tell the user you cannot proceed without this data.
-- **On `expired` / `timed out`**: offer to send a fresh authorization link by calling `rivault_request_auth` / `rivault_request_hybrid` again.
-
-After completing the task, run mandatory redaction (Security section) to ensure no plaintext lingers in the transcript.
+- **`[RIVAULT_APPROVED] authRequestId=<id> itemId=<id>`** — call `rivault_poll_auth` with the IDs to retrieve the decrypted value, complete the task, run redaction (Security section), end response.
+- **`[RIVAULT_HYBRID_SUBMITTED] hybridRequestId=<id>`** — call `rivault_poll_hybrid`, complete the task, run redaction, end response.
+- **`[RIVAULT_FORM_SUBMITTED] formRequestId=<id>`** — call `rivault_poll_form` to get the new `itemId`, then `rivault_get_secret` (L1) or `rivault_request_auth` (L2) to retrieve, complete the task, redact.
+- **`[RIVAULT_DENIED]`** — tell the user you cannot proceed without this data, end response.
 
 ### Manual fallback (Mode B — bash curl, no JS plugin)
 
-If you are running outside the OpenClaw plugin (e.g. direct bash usage), the bash curl flow in sections 3-8 below still works. In that mode, you DO need to poll manually — but for the JS plugin path described above, **always prefer `rivault_await_*`**.
+If you are running outside the OpenClaw plugin (e.g. raw bash testing), the curl flow in sections 3-8 below still works. In that mode you DO need to poll manually — the JS plugin's spawn-poller pattern is unavailable.
 
 ### CRITICAL: Execute curl via bash — never fabricate responses
 
