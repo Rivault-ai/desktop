@@ -82,26 +82,54 @@ export class RivaultClient {
     return this.identity
   }
 
-  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  private async request<T>(
+    path: string,
+    options: RequestInit = {},
+    retryOnTimeout = false,
+  ): Promise<T> {
     const url = `${this.baseUrl}${path}`
-    const res = await fetch(url, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
-        ...(options.headers ?? {}),
-      },
-      signal: AbortSignal.timeout(15_000),
-    })
-    if (!res.ok) {
-      let message = `HTTP ${res.status}`
+    // Status polls go through the daemon proxy which itself calls
+    // upstream + decrypts. Both have 15s timeouts; on a slow path the
+    // outer timeout fires while the inner call is still in flight,
+    // consuming the keypair. Retry once with backoff so the second
+    // call (with the keypair still in the store after the daemon-side
+    // fix) returns plaintext.
+    const maxAttempts = retryOnTimeout ? 3 : 1
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const body = await res.json()
-        message = body.error ?? message
-      } catch {}
-      throw new Error(`Rivault API error: ${message}`)
+        const res = await fetch(url, {
+          ...options,
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${this.apiKey}`,
+            ...(options.headers ?? {}),
+          },
+          signal: AbortSignal.timeout(15_000),
+        })
+        if (!res.ok) {
+          let message = `HTTP ${res.status}`
+          try {
+            const body = await res.json()
+            message = body.error ?? message
+          } catch {}
+          throw new Error(`Rivault API error: ${message}`)
+        }
+        return (await res.json()) as T
+      } catch (err) {
+        const isTimeout =
+          err instanceof Error &&
+          (err.name === 'AbortError' || /aborted|timeout/i.test(err.message))
+        if (!isTimeout || attempt === maxAttempts) {
+          throw err
+        }
+        // Backoff before retry. Daemon's inner call is also ~15s — give
+        // it a beat to finish the upstream round-trip before we knock
+        // again. 2s, then 4s.
+        await new Promise(resolve => setTimeout(resolve, 2_000 * attempt))
+      }
     }
-    return res.json()
+    // Unreachable; loop either returns or throws.
+    throw new Error('request: exhausted retries without throwing')
   }
 
   async search(query: string): Promise<SearchResponse> {
@@ -121,7 +149,7 @@ export class RivaultClient {
   }
 
   async pollAuth(authRequestId: string): Promise<AuthStatusResponse> {
-    return this.request(`/agent/auth-request/${authRequestId}/status`)
+    return this.request(`/agent/auth-request/${authRequestId}/status`, {}, true)
   }
 
   async requestForm(
@@ -137,7 +165,7 @@ export class RivaultClient {
   }
 
   async pollForm(formRequestId: string): Promise<FormStatusResponse> {
-    return this.request(`/agent/form-request/${formRequestId}/status`)
+    return this.request(`/agent/form-request/${formRequestId}/status`, {}, true)
   }
 
   async requestHybrid(
@@ -153,7 +181,7 @@ export class RivaultClient {
   }
 
   async pollHybrid(hybridRequestId: string): Promise<HybridStatusResponse> {
-    return this.request(`/agent/hybrid-request/${hybridRequestId}/status`)
+    return this.request(`/agent/hybrid-request/${hybridRequestId}/status`, {}, true)
   }
 
   async me(): Promise<MeResponse> {

@@ -872,11 +872,14 @@ mod tests {
             parsed.get("envelope").is_none(),
             "envelope must be replaced"
         );
-        // Keypair should be consumed.
-        assert!(
-            transform_auth_status(&state, "areq_xyz", body.as_bytes()).is_none(),
-            "second call has no keypair → returns None"
-        );
+        // Keypair stays in the store after take(): a poll retry after
+        // a timeout still needs to be able to decrypt. The same envelope
+        // bytes will decrypt to the same plaintext, so this is safe.
+        let rewritten2 =
+            transform_auth_status(&state, "areq_xyz", body.as_bytes()).unwrap();
+        let parsed2: serde_json::Value =
+            serde_json::from_slice(&rewritten2).unwrap();
+        assert_eq!(parsed2["value"], "hunter2");
     }
 
     #[test]

@@ -48,7 +48,14 @@ pub struct Envelope {
 
 /// An ephemeral P-256 keypair held by the daemon for the lifetime of one
 /// vault request. Created by `Keypair::generate` before the upstream POST,
-/// passed to [`Keypair::decrypt`] once on the matching status response.
+/// passed to [`Keypair::decrypt`] (or `Keypair::secret` for multi-envelope
+/// flows) on the matching status response.
+///
+/// `Clone` is implemented because [`crate::upstream::keypair_store::KeypairStore::take`]
+/// hands out a clone on every borrow — decryption is idempotent against
+/// the same envelope bytes, and we keep the original alive in the store
+/// until TTL sweep so retry polls after a timeout still succeed.
+#[derive(Clone)]
 pub struct Keypair {
     secret: SecretKey,
     /// Cached SPKI-DER bytes of the public key. Computed once at generation

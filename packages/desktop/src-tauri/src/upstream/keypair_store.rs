@@ -149,36 +149,66 @@ impl KeypairStore {
         mem.insert(request_id.to_string(), keypair);
     }
 
-    /// Pop the keypair so it can be used for one decrypt. Checks
-    /// in-memory first (hot path), then SQLite (cold path after a
-    /// daemon restart).
+    /// Borrow the keypair so it can be used for a decrypt. Does **not**
+    /// delete the underlying row — decryption is idempotent (the upstream
+    /// envelope is the same bytes every time) and the upstream service
+    /// already deletes the envelope from its Redis cache when consumed.
+    ///
+    /// We deliberately keep the keypair alive until TTL sweep (1h) so
+    /// that a poll which times out mid-decrypt doesn't strand subsequent
+    /// retries with an orphaned envelope. Earlier behaviour
+    /// (`HashMap::remove` + `DELETE FROM …`) created a race: when the
+    /// plugin's 15s timeout fired while the daemon's slow upstream call
+    /// was still running, the daemon's eventual `transform_hybrid_status`
+    /// consumed the keypair anyway, leaving every retry stuck on
+    /// "still envelopes". With this change retries succeed.
+    ///
+    /// Callers that *want* to delete (e.g. after explicit task end) can
+    /// call [`Self::delete`].
     pub fn take(&self, request_id: &str) -> Option<Keypair> {
         {
-            let mut mem = self.inner.memory.lock().unwrap();
-            if let Some(kp) = mem.remove(request_id) {
-                if let Some(conn) = &self.inner.conn {
-                    if let Ok(c) = conn.lock() {
-                        let _ = c.execute(
-                            "DELETE FROM proxy_keypairs WHERE request_id = ?",
-                            params![request_id],
-                        );
-                    }
-                }
-                return Some(kp);
+            let mem = self.inner.memory.lock().unwrap();
+            if let Some(kp) = mem.get(request_id) {
+                return Some(kp.clone());
             }
         }
         let (key, conn) = match (&self.inner.wrap_key, &self.inner.conn) {
             (Some(k), Some(c)) => (k, c),
             _ => return None,
         };
-        self.load_and_delete(conn, key, request_id)
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    request_id = %request_id,
-                    "keypair_store: load failed: {e:#}"
+        let loaded = self.load(conn, key, request_id).unwrap_or_else(|e| {
+            tracing::warn!(
+                request_id = %request_id,
+                "keypair_store: load failed: {e:#}"
+            );
+            None
+        })?;
+        // Cache the loaded keypair back in memory so subsequent polls
+        // don't pay the DB-read + AES-unwrap cost.
+        let mut mem = self.inner.memory.lock().unwrap();
+        mem.insert(request_id.to_string(), loaded.clone());
+        Some(loaded)
+    }
+
+    /// Explicitly drop a keypair (and its DB row) once the caller is
+    /// certain it will never be needed again. Today this is unused —
+    /// the TTL sweep handles cleanup — but it's exposed for callers
+    /// that want to free memory immediately after a known-final
+    /// decrypt.
+    #[allow(dead_code)]
+    pub fn delete(&self, request_id: &str) {
+        {
+            let mut mem = self.inner.memory.lock().unwrap();
+            mem.remove(request_id);
+        }
+        if let Some(conn) = &self.inner.conn {
+            if let Ok(c) = conn.lock() {
+                let _ = c.execute(
+                    "DELETE FROM proxy_keypairs WHERE request_id = ?",
+                    params![request_id],
                 );
-                None
-            })
+            }
+        }
     }
 
     fn persist(
@@ -211,7 +241,7 @@ impl KeypairStore {
         Ok(())
     }
 
-    fn load_and_delete(
+    fn load(
         &self,
         conn: &Mutex<Connection>,
         wrap_key: &[u8; 32],
@@ -228,10 +258,6 @@ impl KeypairStore {
         let Some((wrapped_b64, iv_b64)) = row else {
             return Ok(None);
         };
-        let _ = c.execute(
-            "DELETE FROM proxy_keypairs WHERE request_id = ?",
-            params![request_id],
-        );
         drop(c);
 
         let wrapped = B64.decode(wrapped_b64.as_bytes())?;
@@ -301,8 +327,21 @@ mod tests {
         store.store("rq_1", kp);
         assert_eq!(store.len(), 1);
         assert!(store.take("rq_1").is_some());
+        // take() is now non-destructive: the keypair survives so that
+        // a poll retry after a timeout can still decrypt. TTL sweep is
+        // the only deletion path.
+        assert_eq!(store.len(), 1);
+        assert!(store.take("rq_1").is_some());
+    }
+
+    #[test]
+    fn delete_removes_keypair() {
+        let (_tmp, store) = temp_store();
+        store.store("rq_d", Keypair::generate().unwrap());
+        assert!(store.take("rq_d").is_some());
+        store.delete("rq_d");
         assert_eq!(store.len(), 0);
-        assert!(store.take("rq_1").is_none());
+        assert!(store.take("rq_d").is_none());
     }
 
     #[test]
