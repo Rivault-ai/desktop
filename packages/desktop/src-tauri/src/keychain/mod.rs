@@ -15,11 +15,26 @@ const KEY_LEN: usize = 32;
 mod platform {
     use super::*;
     use security_framework::passwords::{
-        delete_generic_password, get_generic_password, set_generic_password,
+        delete_generic_password_options, generic_password, set_generic_password_options,
+        PasswordOptions,
     };
 
+    /// Build a PasswordOptions query that targets the Data Protection Keychain
+    /// (kSecUseDataProtectionKeychain = true, available macOS 10.15+).
+    ///
+    /// The Data Protection Keychain does NOT use binary-hash ACLs. Any process
+    /// running as the same user can read the item after the first login unlock —
+    /// no password prompt on every launch, and no prompt after binary updates.
+    /// This is the same keychain used by iOS/macOS app-extension sharing and
+    /// SwiftUI apps.
+    fn opts() -> PasswordOptions {
+        let mut o = PasswordOptions::new_generic_password(SERVICE, ACCOUNT);
+        o.use_protected_keychain();
+        o
+    }
+
     pub fn load() -> Result<Option<Vec<u8>>> {
-        match get_generic_password(SERVICE, ACCOUNT) {
+        match generic_password(opts()) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.code() == -25300 => Ok(None), // errSecItemNotFound
             Err(e) => Err(anyhow::anyhow!("keychain read: {e}")),
@@ -27,13 +42,16 @@ mod platform {
     }
 
     pub fn store(secret: &[u8]) -> Result<()> {
-        set_generic_password(SERVICE, ACCOUNT, secret)
-            .map_err(|e| anyhow::anyhow!("keychain write: {e}"))
+        // Try update first (item already exists), then add.
+        match set_generic_password_options(secret, opts()) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("keychain write: {e}")),
+        }
     }
 
     #[allow(dead_code)]
     pub fn purge() -> Result<()> {
-        match delete_generic_password(SERVICE, ACCOUNT) {
+        match delete_generic_password_options(opts()) {
             Ok(()) => Ok(()),
             Err(e) if e.code() == -25300 => Ok(()),
             Err(e) => Err(anyhow::anyhow!("keychain delete: {e}")),

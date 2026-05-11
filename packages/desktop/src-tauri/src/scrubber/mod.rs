@@ -8,7 +8,13 @@
 pub mod sqlite;
 
 use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{
+    engine::general_purpose::{
+        STANDARD as B64, STANDARD_NO_PAD as B64_NO_PAD, URL_SAFE as B64_URL,
+        URL_SAFE_NO_PAD as B64_URL_NO_PAD,
+    },
+    Engine,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,18 +45,42 @@ pub const REDACTION_MARKER: &str = "[REDACTED:rivault]";
 
 /// Build the set of needles for a given plaintext value:
 /// - the value itself
-/// - base64 (standard)
+/// - base64 standard, URL-safe, and both unpadded variants (JWTs, OAuth
+///   tokens, and ad-hoc encoding all show up in agent transcripts)
 /// - URL-encoded
 /// - JSON-escaped (string body, no surrounding quotes)
-/// - any caller-supplied precomputed variants (e.g. mobile-precomputed for E2E paths)
+/// - hex (lower + upper), JSON unicode-escape (`\uXXXX` per char) —
+///   skipped for very short plaintexts to avoid false-positive
+///   collisions with unrelated bytes
+/// - any caller-supplied precomputed variants (e.g. mobile-precomputed
+///   for E2E paths)
 pub fn build_needles(plaintext: Option<&str>, supplied_variants: &[String]) -> Vec<String> {
+    /// Minimum plaintext byte-length before adding short-collision-prone
+    /// encodings (hex, unicode-escape). Hex of "a" is "61" which would
+    /// match every random byte in every file; for plaintexts shorter
+    /// than this we skip those variants. Real-world secrets are 8+ bytes
+    /// so this only excludes pathological/degenerate cases.
+    const COLLISION_SAFE_MIN_LEN: usize = 4;
+
     let mut set: BTreeSet<String> = BTreeSet::new();
     if let Some(v) = plaintext {
         if !v.is_empty() {
+            let bytes = v.as_bytes();
             set.insert(v.to_string());
-            set.insert(B64.encode(v.as_bytes()));
+            // Four base64 variants — agents producing JWTs, OAuth
+            // bearer tokens, signed URLs, or plain attachments hit
+            // different ones depending on the library.
+            set.insert(B64.encode(bytes));
+            set.insert(B64_NO_PAD.encode(bytes));
+            set.insert(B64_URL.encode(bytes));
+            set.insert(B64_URL_NO_PAD.encode(bytes));
             set.insert(urlencoding::encode(v).into_owned());
             set.insert(json_escape(v));
+            if v.len() >= COLLISION_SAFE_MIN_LEN {
+                set.insert(hex_encode(bytes, false));
+                set.insert(hex_encode(bytes, true));
+                set.insert(unicode_escape(v));
+            }
         }
     }
     for v in supplied_variants {
@@ -61,6 +91,40 @@ pub fn build_needles(plaintext: Option<&str>, supplied_variants: &[String]) -> V
     // Sort by length desc so we never replace a substring of a still-pending match.
     let mut out: Vec<String> = set.into_iter().collect();
     out.sort_by(|a, b| b.len().cmp(&a.len()));
+    out
+}
+
+fn hex_encode(bytes: &[u8], uppercase: bool) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        if uppercase {
+            s.push_str(&format!("{:02X}", b));
+        } else {
+            s.push_str(&format!("{:02x}", b));
+        }
+    }
+    s
+}
+
+/// Emit `\uXXXX` for every char. Matches what some JSON serializers do
+/// when they unicode-escape every code point (e.g. `JSON.stringify` in
+/// some browsers, or Python's `json.dumps(..., ensure_ascii=True)` on
+/// non-ASCII values). Non-BMP chars (> U+FFFF) are encoded as Rust
+/// surrogate-pair equivalents per JSON spec: `\uHHHH\uLLLL`.
+fn unicode_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 6);
+    for c in s.chars() {
+        let code = c as u32;
+        if code <= 0xFFFF {
+            out.push_str(&format!("\\u{:04x}", code));
+        } else {
+            // Surrogate pair encoding for chars outside the BMP.
+            let v = code - 0x10000;
+            let high = 0xD800 + (v >> 10);
+            let low = 0xDC00 + (v & 0x3FF);
+            out.push_str(&format!("\\u{:04x}\\u{:04x}", high, low));
+        }
+    }
     out
 }
 
@@ -151,12 +215,57 @@ pub fn scrub_paths_until(
     let mut backoff = std::time::Duration::from_millis(100);
     let backoff_cap = std::time::Duration::from_secs(5);
 
+    // Working copy of precounts. We extend it on every pass with any
+    // `.jsonl` siblings that have appeared since the release snapshot
+    // (e.g. the agent rotated its transcript mid-task, or a sub-process
+    // spawned a new session file). New files default to pre-count = 0
+    // for every needle, so every occurrence in them is task-window
+    // content by definition — they get fully scrubbed by Scope 2 and
+    // checked by the precount verifier.
+    let mut working_precount: HashMap<String, HashMap<String, usize>> =
+        anchors.files_precount.clone();
+
+    // Parent dirs to re-walk on every retry. Seed from the primary
+    // transcript paths (their parents) and from any pre-existing
+    // precount entries (their parents). One level only — same as
+    // `precount_runtime_siblings` in the orchestrator.
+    let parent_dirs: BTreeSet<PathBuf> = {
+        let mut s: BTreeSet<PathBuf> = BTreeSet::new();
+        for p in paths {
+            let path = Path::new(p);
+            if path.is_dir() {
+                s.insert(path.to_path_buf());
+            } else if let Some(parent) = path.parent() {
+                s.insert(parent.to_path_buf());
+            }
+        }
+        for k in anchors.files_precount.keys() {
+            if let Some(parent) = Path::new(k).parent() {
+                s.insert(parent.to_path_buf());
+            }
+        }
+        s
+    };
+
+    // Primary transcript paths are protected by Scope 1's offset
+    // anchor and (in production) by the orchestrator's own precount
+    // entry. We must NOT auto-add them to the precount with pre=0,
+    // because that would let Scope 2 wipe pre-release content the
+    // offset is supposed to preserve.
+    let primaries: BTreeSet<String> = paths.iter().cloned().collect();
+
     loop {
         attempt += 1;
 
+        // Pull in any `.jsonl` siblings that have appeared since the
+        // last pass. Existing entries are left alone so we never
+        // overwrite their pre-counts.
+        discover_new_jsonl_siblings(&parent_dirs, &primaries, &mut working_precount);
+
         // Each pass: Scope 1 on the primary paths (targeted, offset-
         // anchored) then Scope 2 on every precounted file (which now
-        // includes the primary via `precount_runtime_siblings`).
+        // includes the primary via `precount_runtime_siblings` plus
+        // any files discovered mid-task).
         for p in paths {
             let path = Path::new(p);
             if !path.exists() {
@@ -169,8 +278,8 @@ pub fn scrub_paths_until(
                 scrub_one(path, needles, start, &mut report)?;
             }
         }
-        if !anchors.files_precount.is_empty() {
-            scrub_runtime_wide(needles, &anchors.files_precount, &mut report)?;
+        if !working_precount.is_empty() {
+            scrub_runtime_wide(needles, &working_precount, &mut report)?;
             report.scope_used = Some(ScopeUsed::RuntimeWide);
         } else if report.scope_used.is_none() {
             report.scope_used = Some(ScopeUsed::Targeted);
@@ -178,7 +287,7 @@ pub fn scrub_paths_until(
 
         // Verify both surfaces.
         let primary_ok = verify(paths, needles, offsets)?;
-        let siblings_ok = verify_with_precounts(needles, &anchors.files_precount)?;
+        let siblings_ok = verify_with_precounts(needles, &working_precount)?;
         if primary_ok && siblings_ok {
             report.verified = true;
             tracing::debug!(
@@ -275,6 +384,43 @@ pub fn scrub_sqlite_anchors(
         total.wal_truncated = total.wal_truncated || r.wal_truncated;
     }
     Ok(total)
+}
+
+/// Walk `parent_dirs` (one level, no recursion) and add any `.jsonl`
+/// file not already in `working_precount` with an empty per-needle map.
+///
+/// Empty map means "we never counted this file at release time" — the
+/// Scope-2 scrubber treats `pre = 0` for every needle, so any
+/// occurrence we find is task-window content and gets redacted in full.
+/// Existing entries are left alone so their pre-counts (which protect
+/// pre-release content from being touched) are preserved across retries.
+fn discover_new_jsonl_siblings(
+    parent_dirs: &BTreeSet<PathBuf>,
+    primaries: &BTreeSet<String>,
+    working_precount: &mut HashMap<String, HashMap<String, usize>>,
+) {
+    for parent in parent_dirs {
+        let Ok(read) = fs::read_dir(parent) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let key = p.display().to_string();
+            // Primaries are handled by Scope 1's offset anchor and by
+            // the orchestrator's own precount entry — never auto-add
+            // them with pre=0.
+            if primaries.contains(&key) {
+                continue;
+            }
+            working_precount.entry(key).or_default();
+        }
+    }
 }
 
 /// Scope 2: runtime-wide. Walk every file we pre-counted at release time
@@ -828,6 +974,131 @@ mod tests {
         assert!(!after.contains("secret-x"));
         assert_eq!(after.matches(REDACTION_MARKER).count(), 2);
         assert_eq!(report.scope_used, Some(ScopeUsed::RuntimeWide));
+        assert!(report.verified);
+    }
+
+    #[test]
+    fn handles_url_safe_base64() {
+        // JWT-style payload: URL-safe base64 of the secret embedded in
+        // a `eyJhbGciOi...` style blob would use URL_SAFE.
+        let secret = "Hello+World/Foo=";
+        // URL-safe b64 of this value substitutes + → -, / → _, = → padding.
+        let url_safe = "SGVsbG8rV29ybGQvRm9vPQ=="
+            .replace('+', "-")
+            .replace('/', "_");
+        let body = format!("token={} end", url_safe);
+        let p = tmpfile("urlsafe.jsonl", &body);
+        let needles = build_needles(Some(secret), &[]);
+        let report =
+            scrub_paths(&[p.display().to_string()], &needles, &no_anchors()).unwrap();
+        assert!(report.verified);
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(!after.contains(&url_safe), "url-safe b64 must be redacted: {after}");
+    }
+
+    #[test]
+    fn handles_base64_unpadded() {
+        // JWT segments are typically unpadded URL-safe base64.
+        let secret = "open-sesame-please";
+        let url_safe_no_pad = B64_URL_NO_PAD.encode(secret.as_bytes());
+        let p = tmpfile(
+            "jwt.jsonl",
+            &format!("\"jwt\": \"header.{}.sig\"", url_safe_no_pad),
+        );
+        let needles = build_needles(Some(secret), &[]);
+        let _ = scrub_paths(&[p.display().to_string()], &needles, &no_anchors()).unwrap();
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(
+            !after.contains(&url_safe_no_pad),
+            "unpadded URL-safe b64 must be redacted: {after}"
+        );
+    }
+
+    #[test]
+    fn handles_hex_encoding() {
+        // Some debug paths (curl --data-binary, hexdumps, low-level
+        // libs) emit hex. Both cases covered.
+        let secret = "alpha-bravo-charlie";
+        let hex_lo = hex_encode(secret.as_bytes(), false);
+        let hex_up = hex_encode(secret.as_bytes(), true);
+        let p = tmpfile(
+            "hex.jsonl",
+            &format!("dump lo {} dump up {} end", hex_lo, hex_up),
+        );
+        let needles = build_needles(Some(secret), &[]);
+        let _ = scrub_paths(&[p.display().to_string()], &needles, &no_anchors()).unwrap();
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(!after.contains(&hex_lo), "lowercase hex must be redacted: {after}");
+        assert!(!after.contains(&hex_up), "uppercase hex must be redacted: {after}");
+    }
+
+    #[test]
+    fn handles_unicode_escape() {
+        // `JSON.stringify` in some pipelines (or Python's
+        // `ensure_ascii=True`) emits every char as `\uXXXX`.
+        let secret = "tokenABC";
+        let escaped = unicode_escape(secret);
+        // Sanity-check the helper.
+        assert_eq!(
+            escaped,
+            "\\u0074\\u006f\\u006b\\u0065\\u006e\\u0041\\u0042\\u0043"
+        );
+        let p = tmpfile("unicode.jsonl", &format!("payload: \"{}\" end", escaped));
+        let needles = build_needles(Some(secret), &[]);
+        let _ = scrub_paths(&[p.display().to_string()], &needles, &no_anchors()).unwrap();
+        let after = fs::read_to_string(&p).unwrap();
+        assert!(
+            !after.contains(&escaped),
+            "unicode-escaped form must be redacted: {after}"
+        );
+    }
+
+    #[test]
+    fn short_plaintext_skips_collision_prone_encodings() {
+        // For pathologically-short plaintexts ("a" → hex "61"), hex and
+        // unicode-escape forms are skipped to avoid wiping unrelated
+        // file content. The literal value is still in the needle list.
+        let needles = build_needles(Some("a"), &[]);
+        // hex("a") = "61" — must NOT appear.
+        assert!(!needles.iter().any(|n| n == "61"));
+        // unicode_escape("a") = "\\u0061" — must NOT appear.
+        assert!(!needles.iter().any(|n| n == "\\u0061"));
+        // The raw byte is still tracked.
+        assert!(needles.iter().any(|n| n == "a"));
+    }
+
+    #[test]
+    fn discovers_new_sibling_jsonl_created_after_release() {
+        // Simulates the failure mode where the agent rotated its
+        // transcript (or a sub-process opened a new session file) AFTER
+        // the release snapshot. The new file is not in
+        // `anchors.files_precount`, so without re-enumeration it would
+        // be a silent miss. With re-enumeration, the retry pass
+        // discovers it, scrubs it, and verify passes.
+        let primary = tmpfile("primary.jsonl", "primary line clean\n");
+        let new_sibling = primary.parent().unwrap().join("rotated.jsonl");
+        // Sibling exists with the secret BUT was not present at release
+        // time, so anchors knows nothing about it.
+        fs::write(&new_sibling, "agent wrote: rotated-secret here\n").unwrap();
+
+        let needles = build_needles(Some("rotated-secret"), &[]);
+        let mut anchors = ScrubAnchors::default();
+        anchors.files.insert(primary.display().to_string(), 0);
+        // Note: `rotated.jsonl` deliberately NOT in files_precount.
+
+        let report = scrub_paths(
+            &[primary.display().to_string()],
+            &needles,
+            &anchors,
+        )
+        .unwrap();
+
+        let after = fs::read_to_string(&new_sibling).unwrap();
+        assert!(
+            !after.contains("rotated-secret"),
+            "newly-appearing sibling must be scrubbed: {after}"
+        );
+        assert!(after.contains(REDACTION_MARKER));
         assert!(report.verified);
     }
 
