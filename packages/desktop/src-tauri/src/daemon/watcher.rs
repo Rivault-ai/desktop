@@ -17,6 +17,63 @@ use tokio::sync::oneshot;
 
 use crate::triggers::stop_signal::line_signals_stop;
 
+/// Watch a SQLite DB (and its -wal file) for write activity. Resolves the
+/// returned receiver once the DB has been quiet (no mtime change on either
+/// the DB or the WAL file) for `quiet_secs` consecutive seconds, or after
+/// `cap_secs` total — whichever comes first. Used to defer the post-task
+/// SQLite scrub until OpenClaw finishes writing its memory summaries.
+pub fn watch_sqlite_for_quiet(
+    db_path: PathBuf,
+    quiet_secs: u64,
+    cap_secs: u64,
+) -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel::<()>();
+    std::thread::Builder::new()
+        .name("rivault-sqlite-quiet".into())
+        .spawn(move || {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(cap_secs);
+            let quiet = std::time::Duration::from_secs(quiet_secs);
+            let poll = std::time::Duration::from_secs(2);
+
+            let wal = {
+                let name = db_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                db_path.with_file_name(format!("{}-wal", name))
+            };
+
+            let mtime = |p: &std::path::Path| {
+                p.metadata().and_then(|m| m.modified()).ok()
+            };
+
+            let mut last_change = std::time::Instant::now();
+            let mut prev_db = mtime(&db_path);
+            let mut prev_wal = mtime(&wal);
+
+            loop {
+                std::thread::sleep(poll);
+                let now = std::time::Instant::now();
+                let db_mt = mtime(&db_path);
+                let wal_mt = mtime(&wal);
+                if db_mt != prev_db || wal_mt != prev_wal {
+                    last_change = now;
+                    prev_db = db_mt;
+                    prev_wal = wal_mt;
+                }
+                // Fire when quiet for long enough OR cap exceeded.
+                if last_change.elapsed() >= quiet || now >= deadline {
+                    let _ = tx.send(());
+                    return;
+                }
+            }
+        })
+        .ok();
+    rx
+}
+
 /// Watch the given files (or directories) and resolve the returned receiver
 /// the first time any of them appends a line containing a stop signal.
 pub fn watch_for_stop(paths: Vec<PathBuf>) -> Result<oneshot::Receiver<()>> {
