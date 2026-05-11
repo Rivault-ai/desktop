@@ -43,6 +43,17 @@ interface ConfigStatus {
   base_url: string | null;
 }
 
+// Build-time metadata injected by Vite (see vite.config.ts). These are
+// string literals at runtime, so they survive minification and dead-code
+// elimination. Allows the user to identify exactly which build is running
+// without having to dig into the macOS package info.
+const APP_VERSION = (import.meta as { env: Record<string, string> }).env
+  .VITE_APP_VERSION;
+const APP_GIT_SHA = (import.meta as { env: Record<string, string> }).env
+  .VITE_APP_GIT_SHA;
+const APP_BUILT_AT = (import.meta as { env: Record<string, string> }).env
+  .VITE_APP_BUILT_AT;
+
 function statusOf(e: LedgerEntry): { label: string; color: string } {
   if (e.scrubbed_at && e.scrub_verified)
     return { label: "scrubbed", color: "#16a34a" };
@@ -216,6 +227,42 @@ export default function App() {
           </table>
         )}
       </section>
+
+      <BuildInfoFooter />
     </div>
+  );
+}
+
+function BuildInfoFooter() {
+  const [copied, setCopied] = useState(false);
+  const builtAtPretty = (() => {
+    try {
+      return new Date(APP_BUILT_AT).toLocaleString();
+    } catch {
+      return APP_BUILT_AT;
+    }
+  })();
+  const summary = `Rivault v${APP_VERSION} · ${APP_GIT_SHA} · built ${builtAtPretty}`;
+  return (
+    <footer
+      className="build-footer"
+      title="Click to copy build info — useful when filing a bug report"
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(summary);
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 1500);
+        } catch {
+          /* clipboard blocked — silently no-op */
+        }
+      }}
+    >
+      <span className="build-version">v{APP_VERSION}</span>
+      <span className="build-sep">·</span>
+      <span className="build-sha mono">{APP_GIT_SHA}</span>
+      <span className="build-sep">·</span>
+      <span className="build-time">built {builtAtPretty}</span>
+      {copied && <span className="build-copied">copied</span>}
+    </footer>
   );
 }
