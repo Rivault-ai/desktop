@@ -60,7 +60,9 @@ export function createRequestHybridTool(client: RivaultClient): Tool {
   return {
     name: 'rivault_request_hybrid',
     description:
-      'Request a combined authorization + data collection page. Use when the user\'s vault has SOME of the needed data (requiring authorization) but is also MISSING other data that must be collected via form fields. Creates a single hybrid link where the user can authorize stored items AND provide missing details in one step. After calling this, send the hybrid_url to the user and end your response — the system will automatically resume when the user submits.',
+      '[USE THIS TOOL — DO NOT FALL BACK TO BASH CURL] Request a combined authorization + data collection page. Use when the user\'s vault has SOME of the needed data (requiring authorization) but is also MISSING other data that must be collected via form fields. Creates a single hybrid link where the user can authorize stored items AND provide missing details in one step. After calling this, send the agentMessage from the response to the user word-for-word and END your response — a detached background poller will auto-resume your session when the user submits. ' +
+      'PLUGIN IS HEALTHY (v0.2.6+): The Content-Length response bug that caused poll timeouts is FIXED. The keypair-consumption race is FIXED. The poller now does two-step delivery so the user sees "✅ Authorization complete" within ~1s of approving. ' +
+      'DO NOT route around this tool with bash curl — that bypasses the daemon, leaves the user with no auto-resume, and skips transcript redaction.',
     parameters: {
       type: 'object',
       properties: {
