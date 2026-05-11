@@ -83,12 +83,25 @@ If you are running outside the OpenClaw plugin (e.g. direct bash usage), the bas
 
 ## Environment
 
+**Mode B preamble — auto-discover the Rivault desktop daemon and route through it when running.** When the Rivault desktop app is installed and signed in, it writes a discovery file at `~/Library/Application Support/Rivault/daemon.json` (mode 0600) with the localhost port it's bound to. Routing curls through that local port means the daemon (a) records every release in its ledger and (b) feeds the plaintext into the cross-runtime scanner that redacts it across every agent transcript on disk — including leaks from exec output (`browser-use type "$VALUE"` etc.) that the agent's own redaction step can't catch in time.
+
+Run this block ONCE at the top of any Rivault-using bash flow before any curl:
+
 ```bash
-RIVAULT_API_URL="${RIVAULT_API_URL:-https://api.rivault.ai}"
+DAEMON_JSON="${HOME}/Library/Application Support/Rivault/daemon.json"
+if [ -z "${RIVAULT_API_URL:-}" ] && [ -r "$DAEMON_JSON" ]; then
+  PORT=$(awk -F'[:,}]' '/"http_port"/{gsub(/[^0-9]/,"",$2); print $2}' "$DAEMON_JSON" | head -1)
+  if [ -n "$PORT" ]; then
+    export RIVAULT_API_URL="http://127.0.0.1:$PORT"
+  fi
+fi
+export RIVAULT_API_URL="${RIVAULT_API_URL:-https://api.rivault.ai}"
 ```
 
+After this, every curl below uses `$RIVAULT_API_URL` and automatically routes through the daemon if it's running, the public API otherwise. No other change needed.
+
 - `RIVAULT_API_KEY` (required) — API key
-- `RIVAULT_API_URL` (optional) — defaults to `https://api.rivault.ai`
+- `RIVAULT_API_URL` (optional) — defaults to the daemon URL if discovered, else `https://api.rivault.ai`
 - `RIVAULT_RETURN_URL` (optional) — deep link for returning user to chat app after authorization. If set, include as `"returnUrl"` in POST request bodies. Per-platform values:
   - WhatsApp: `whatsapp://` (opens the app to the user's last chat)
   - Telegram: `tg://` (opens the app to the user's last chat)
@@ -564,6 +577,22 @@ User sees TWO separate messages (30s apart):
 - Use `--max-time 15` on every curl command
 - Pipe curl output through `jq` to extract only needed fields
 - Never echo/log/store curl output containing secret values
+
+### Exec-output leak vector — pass secrets via files, not shell variables
+
+Some tools echo their input back to stdout (e.g. `browser-use type "$PHONE"` prints `typed: <value>`). OpenClaw captures that stdout into the exec-completion system message which lands in the session JSONL **before** the agent's own redaction step runs. The Rivault daemon's cross-runtime scanner catches this on the next file-write event (~500ms-1s later) **only if** the curl that retrieved the value went through the daemon — see the "Mode B preamble" above. Even with that, prefer to avoid the leak entirely:
+
+- ❌ `browser-use type "$PHONE"` — echoes the value
+- ✅ Write the value to a 0600 tempfile and have the tool read from it:
+
+  ```bash
+  TMPF=$(mktemp); chmod 600 "$TMPF"
+  printf '%s' "$PHONE" > "$TMPF"
+  browser-use type --from-file "$TMPF"
+  rm -f "$TMPF"
+  ```
+
+Same principle for any tool with stdout echo. When no `--from-file` option exists, redirect stdout to `/dev/null` and verify the result via a separate state check rather than reading echoed output.
 
 ### MANDATORY Post-Task Redaction
 
