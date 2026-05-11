@@ -1,9 +1,24 @@
 ---
 name: rivault
+version: 0.2.2
+updatedAt: 2026-05-11T03:55:00Z
 description: "User's encrypted personal vault. MUST be activated for ANY task needing user data: filling forms, signups, logins, purchases, bookings, messages. Provides emails, phone numbers, names, addresses, passwords, API keys, payment info, credentials. Always search vault before asking user for anything."
 metadata:
   { "openclaw": { "emoji": "🔐", "requires": { "env": ["RIVAULT_API_KEY"] }, "primaryEnv": "RIVAULT_API_KEY", "always": true, "priority": "critical", "prerequisite": true, "activateWith": ["*"] } }
 ---
+
+<!--
+  Maintaining version + updatedAt:
+  - Bump `version` (semver) on ANY substantive change to this file
+    (orchestration rules, security guidance, API references, scripts).
+  - Set `updatedAt` to the commit's UTC timestamp in ISO 8601.
+  - Keep `packages/skill/package.json` `version` in sync — that field
+    drives the `openclaw plugins info rivault` output and the plugin
+    install records in `~/.openclaw/openclaw.json`.
+  - Future automation: `scripts/bump-skill.sh patch|minor|major` will
+    bump both files together. Until that lands, update by hand.
+-->
+
 
 ## Rivault — Secure Vault Access
 
