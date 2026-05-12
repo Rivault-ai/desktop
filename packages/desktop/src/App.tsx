@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import Setup from "./Setup";
+import rivaultLogo from "./assets/rivault-logo-wide.svg";
 import "./App.css";
+
+const VAULT_URL = "https://www.rivault.ai/dashboard";
 
 type Tier = "l1" | "l2";
 type AgentRuntime =
@@ -41,6 +45,7 @@ interface ConfigStatus {
   user_id: string | null;
   api_key_masked: string | null;
   base_url: string | null;
+  imported_from_openclaw: boolean;
 }
 
 // Build-time metadata injected by Vite (see vite.config.ts). These are
@@ -56,7 +61,7 @@ const APP_BUILT_AT = (import.meta as { env: Record<string, string> }).env
 
 function statusOf(e: LedgerEntry): { label: string; color: string } {
   if (e.scrubbed_at && e.scrub_verified)
-    return { label: "scrubbed", color: "#16a34a" };
+    return { label: "redacted", color: "#16a34a" };
   if (e.scrubbed_at && !e.scrub_verified)
     return { label: "unverified", color: "#f97316" };
   if (e.rotated_at) return { label: "rotated", color: "#a855f7" };
@@ -72,11 +77,24 @@ function fmtTime(iso: string | null): string {
   }
 }
 
+const PAGE_SIZE = 20;
+
 export default function App() {
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [releases, setReleases] = useState<LedgerEntry[]>([]);
   const [config, setConfig] = useState<ConfigStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [page, setPage] = useState(0);
+  const [toast, setToast] = useState<string | null>(null);
+
+  // Auto-import toast: fires once when the daemon imported an OpenClaw key at startup.
+  useEffect(() => {
+    if (config?.imported_from_openclaw) {
+      setToast("Connected using your OpenClaw API key");
+      const t = window.setTimeout(() => setToast(null), 4500);
+      return () => window.clearTimeout(t);
+    }
+  }, [config?.imported_from_openclaw]);
 
   useEffect(() => {
     let cancelled = false;
@@ -94,6 +112,7 @@ export default function App() {
             user_id: null,
             api_key_masked: null,
             base_url: null,
+            imported_from_openclaw: false,
           }) as ConfigStatus,
         ),
       ]);
@@ -130,14 +149,30 @@ export default function App() {
   const open = releases.filter((r) => !r.scrubbed_at).length;
   const scrubbed = releases.filter((r) => r.scrubbed_at).length;
 
+  const totalPages = Math.max(1, Math.ceil(releases.length / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages - 1);
+  const pageStart = safePage * PAGE_SIZE;
+  const pageRows = releases.slice(pageStart, pageStart + PAGE_SIZE);
+
   return (
     <div className="app">
+      {toast && <div className="toast">{toast}</div>}
       <header>
         <div className="header-row">
-          <h1>Rivault</h1>
+          <img src={rivaultLogo} alt="Rivault" className="header-logo" />
           {config.user_id && (
             <div className="header-identity">
               <code>{config.api_key_masked}</code>
+              <button
+                className="link"
+                onClick={() => {
+                  openUrl(VAULT_URL).catch(() => {
+                    /* opener blocked — ignore */
+                  });
+                }}
+              >
+                View vault
+              </button>
               <button
                 className="link"
                 onClick={async () => {
@@ -152,28 +187,9 @@ export default function App() {
           )}
         </div>
         <p className="subtitle">
-          Deterministic local plaintext redaction for AI agent transcripts.
+          Deterministic redaction agent of values retrieved from your Rivault vault
         </p>
       </header>
-
-      <section className="status">
-        <div>
-          <span className="label">Unix socket</span>
-          <code>{status?.socket_path ?? "…"}</code>
-        </div>
-        <div>
-          <span className="label">Localhost HTTP</span>
-          <code>{status?.http_port ? `127.0.0.1:${status.http_port}` : "—"}</code>
-        </div>
-        <div>
-          <span className="label">Browser token (prefix)</span>
-          <code>{status?.browser_token_prefix ?? "…"}…</code>
-        </div>
-        <div>
-          <span className="label">WebSocket channel</span>
-          <code>{status?.websocket_configured ? "configured" : "off"}</code>
-        </div>
-      </section>
 
       <section className="counts">
         <div className="count">
@@ -182,7 +198,7 @@ export default function App() {
         </div>
         <div className="count">
           <span className="num">{scrubbed}</span>
-          <span className="cap">scrubbed</span>
+          <span className="cap">redacted</span>
         </div>
       </section>
 
@@ -206,7 +222,7 @@ export default function App() {
               </tr>
             </thead>
             <tbody>
-              {releases.map((r) => {
+              {pageRows.map((r) => {
                 const s = statusOf(r);
                 return (
                   <tr key={r.release_id}>
@@ -226,7 +242,50 @@ export default function App() {
             </tbody>
           </table>
         )}
+        {releases.length > PAGE_SIZE && (
+          <div className="pagination">
+            <button
+              className="page-btn"
+              onClick={() => setPage(safePage - 1)}
+              disabled={safePage === 0}
+            >
+              ‹ Prev
+            </button>
+            <span className="page-info">
+              {pageStart + 1}–{Math.min(pageStart + PAGE_SIZE, releases.length)} of {releases.length}
+            </span>
+            <button
+              className="page-btn"
+              onClick={() => setPage(safePage + 1)}
+              disabled={safePage >= totalPages - 1}
+            >
+              Next ›
+            </button>
+          </div>
+        )}
       </section>
+
+      <details className="conn-details">
+        <summary>Connection details</summary>
+        <section className="status">
+          <div>
+            <span className="label">Unix socket</span>
+            <code>{status?.socket_path ?? "…"}</code>
+          </div>
+          <div>
+            <span className="label">Localhost HTTP</span>
+            <code>{status?.http_port ? `127.0.0.1:${status.http_port}` : "—"}</code>
+          </div>
+          <div>
+            <span className="label">Browser token (prefix)</span>
+            <code>{status?.browser_token_prefix ?? "…"}…</code>
+          </div>
+          <div>
+            <span className="label">WebSocket channel</span>
+            <code>{status?.websocket_configured ? "configured" : "off"}</code>
+          </div>
+        </section>
+      </details>
 
       <BuildInfoFooter />
     </div>

@@ -62,22 +62,54 @@ pub fn clear() -> Result<()> {
     Ok(())
 }
 
-/// Validate an API key against the configured base URL by hitting `/agent/me`.
-/// Returns the resolved identity on success.
+/// Validate an API key against the configured base URL.
+///
+/// Tries `/agent/me` first (returns `{userId, apiKeyId}` on a recent backend).
+/// Falls back to `/agent/vault/search?q=.&limit=1` for older deploys — that
+/// endpoint exists and authenticates the key, but doesn't expose identity,
+/// so the resulting `MeResponse` has empty fields.
 pub async fn validate(api_key: &str, base_url: &str) -> Result<MeResponse> {
-    let url = format!("{}/agent/me", base_url.trim_end_matches('/'));
-    let res = reqwest::Client::new()
-        .get(&url)
+    let base = base_url.trim_end_matches('/');
+    let client = reqwest::Client::new();
+    let timeout = std::time::Duration::from_secs(10);
+
+    let me_res = client
+        .get(format!("{base}/agent/me"))
         .bearer_auth(api_key)
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(timeout)
         .send()
         .await
         .context("network error contacting Rivault API")?;
-    if !res.status().is_success() {
-        anyhow::bail!("API rejected key (HTTP {})", res.status().as_u16());
+
+    let status = me_res.status();
+    if status.is_success() {
+        let me: MeResponse = me_res
+            .json()
+            .await
+            .context("decode /agent/me response")?;
+        return Ok(me);
     }
-    let me: MeResponse = res.json().await.context("decode /agent/me response")?;
-    Ok(me)
+    if status.as_u16() != 404 {
+        anyhow::bail!("API rejected key (HTTP {})", status.as_u16());
+    }
+
+    // /agent/me missing — backend predates the endpoint. Probe an endpoint
+    // that does exist and authenticates the key.
+    let probe = client
+        .get(format!("{base}/agent/vault/search"))
+        .query(&[("q", ".")])
+        .bearer_auth(api_key)
+        .timeout(timeout)
+        .send()
+        .await
+        .context("network error contacting Rivault API (fallback)")?;
+    if !probe.status().is_success() {
+        anyhow::bail!("API rejected key (HTTP {})", probe.status().as_u16());
+    }
+    Ok(MeResponse {
+        user_id: String::new(),
+        api_key_id: None,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -38,6 +38,9 @@ function buildMetadata() {
 export default defineConfig(async () => ({
   plugins: [react()],
   define: buildMetadata(),
+  resolve: {
+    alias: { "@": join(__dirname, "src") },
+  },
 
   // Tauri 2 loads bundled HTML through a custom protocol. Absolute asset
   // URLs (`/assets/foo.js`) don't resolve there and the window renders blank;

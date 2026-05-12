@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* CSS variable definitions copied from the web app's globals.css so the
+   shadcn primitives (Button, Card, Input, …) look identical in the
+   desktop's Setup screen. Always-dark, because the desktop window is dark. */
+:root {
+  --background: 0 0% 8%;
+  --foreground: 0 0% 93%;
+  --card: 240 5% 11%;
+  --card-foreground: 0 0% 93%;
+  --popover: 240 5% 11%;
+  --popover-foreground: 0 0% 93%;
+  --primary: 79 100% 50%;
+  --primary-foreground: 0 0% 0%;
+  --secondary: 240 4% 16%;
+  --secondary-foreground: 0 0% 93%;
+  --muted: 240 4% 16%;
+  --muted-foreground: 240 5% 62%;
+  --accent: 240 4% 16%;
+  --accent-foreground: 0 0% 93%;
+  --destructive: 0 63% 31%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 240 4% 20%;
+  --input: 240 4% 16%;
+  --ring: 79 100% 50%;
+  --radius: 0.625rem;
+  --lime-bright: 79 100% 50%;
+}

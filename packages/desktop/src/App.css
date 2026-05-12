@@ -15,17 +15,56 @@ body {
   padding: 32px 24px;
 }
 
-header h1 {
-  margin: 0 0 4px;
-  font-size: 22px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
+.header-logo {
+  height: 21px;
+  width: auto;
+  display: block;
+  margin: 0 0 16px;
 }
 
 .subtitle {
   color: #9ca3af;
   font-size: 13px;
   margin: 0 0 28px;
+}
+
+.conn-details {
+  margin-top: 24px;
+}
+
+.conn-details > summary {
+  font-size: 12px;
+  color: #6b7280;
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  user-select: none;
+}
+
+.conn-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.conn-details > summary::before {
+  content: "›";
+  display: inline-block;
+  transition: transform 0.15s ease;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.conn-details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.conn-details > summary:hover {
+  color: #9ca3af;
+}
+
+.conn-details .status {
+  margin-top: 12px;
 }
 
 .status {
@@ -94,6 +133,38 @@ header h1 {
   margin: 0 0 12px;
 }
 
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 12px;
+  font-size: 12px;
+}
+
+.page-btn {
+  background: #0f0f10;
+  border: 1px solid #1f2937;
+  color: #d4d4d8;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.page-btn:hover:not(:disabled) {
+  background: #1f2937;
+}
+
+.page-btn:disabled {
+  color: #4b5563;
+  cursor: not-allowed;
+}
+
+.page-info {
+  color: #6b7280;
+}
+
 .empty {
   color: #6b7280;
   font-size: 13px;
@@ -141,6 +212,27 @@ td.mono {
   border-radius: 6px;
   font-size: 12px;
   margin-bottom: 16px;
+}
+
+.toast {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #0f172a;
+  border: 1px solid #1f2937;
+  color: #d4d4d8;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  z-index: 100;
+  animation: toast-in 200ms ease;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translate(-50%, -8px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
 }
 
 /* ---------- header identity row ---------- */
@@ -291,6 +383,59 @@ button.link:hover {
 
 .setup-actions a.muted:hover {
   color: #9ca3af;
+}
+
+/* The "Sign in with Rivault" primary button (used outside a form). */
+.setup-actions button[type="button"]:not(.link):not(.secondary) {
+  background: #3b82f6;
+  color: white;
+  border: none;
+  padding: 10px 18px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  width: 100%;
+  transition: background 120ms ease;
+}
+
+.setup-actions button[type="button"]:not(.link):not(.secondary):hover:not(:disabled) {
+  background: #2563eb;
+}
+
+.setup-actions button.secondary {
+  background: transparent;
+  color: #d4d4d8;
+  border: 1px solid #1f2937;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.setup-actions button.secondary:hover {
+  background: #1f2937;
+}
+
+.setup-secondary {
+  margin-top: 16px;
+  text-align: center;
+}
+
+.setup-pair-status {
+  color: #d4d4d8;
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0 0 20px;
+  padding: 16px;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  border-radius: 6px;
+}
+
+.setup-pair-status .muted {
+  color: #9ca3af;
+  font-size: 12px;
 }
 
 .setup-error {

@@ -1,113 +1,69 @@
 //! Per-install IPC HMAC secret storage.
 //!
-//! On macOS uses the system Keychain (`com.rivault.daemon.ipc-key`, scoped to
-//! the current user). On other platforms falls back to a 0600 file in the app
-//! data directory — sufficient for development; production targets macOS.
+//! Stores a 32-byte random secret in a 0600 file under the app data directory.
+//! On macOS: ~/Library/Application Support/Rivault/ipc-key
+//! On Linux: ~/.local/share/Rivault/ipc-key
+//!
+//! The macOS Keychain approach was abandoned because kSecUseDataProtectionKeychain
+//! requires entitlements only available to properly notarized/signed apps, and the
+//! legacy SecKeychain API ties items to the binary's code-signature hash causing
+//! password prompts on every rebuild.
 
 use anyhow::{Context, Result};
 use rand::RngCore;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
-const SERVICE: &str = "com.rivault.daemon.ipc-key";
-const ACCOUNT: &str = "default";
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 const KEY_LEN: usize = 32;
 
-#[cfg(target_os = "macos")]
-mod platform {
-    use super::*;
-    use security_framework::passwords::{
-        delete_generic_password_options, generic_password, set_generic_password_options,
-        PasswordOptions,
-    };
-
-    /// Build a PasswordOptions query that targets the Data Protection Keychain
-    /// (kSecUseDataProtectionKeychain = true, available macOS 10.15+).
-    ///
-    /// The Data Protection Keychain does NOT use binary-hash ACLs. Any process
-    /// running as the same user can read the item after the first login unlock —
-    /// no password prompt on every launch, and no prompt after binary updates.
-    /// This is the same keychain used by iOS/macOS app-extension sharing and
-    /// SwiftUI apps.
-    fn opts() -> PasswordOptions {
-        let mut o = PasswordOptions::new_generic_password(SERVICE, ACCOUNT);
-        o.use_protected_keychain();
-        o
-    }
-
-    pub fn load() -> Result<Option<Vec<u8>>> {
-        match generic_password(opts()) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.code() == -25300 => Ok(None), // errSecItemNotFound
-            Err(e) => Err(anyhow::anyhow!("keychain read: {e}")),
-        }
-    }
-
-    pub fn store(secret: &[u8]) -> Result<()> {
-        // Try update first (item already exists), then add.
-        match set_generic_password_options(secret, opts()) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("keychain write: {e}")),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn purge() -> Result<()> {
-        match delete_generic_password_options(opts()) {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == -25300 => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("keychain delete: {e}")),
-        }
-    }
+fn secret_path() -> Result<PathBuf> {
+    let dir = dirs::data_dir()
+        .context("cannot locate app data directory")?
+        .join("Rivault");
+    fs::create_dir_all(&dir).ok();
+    Ok(dir.join("ipc-key"))
 }
 
-#[cfg(not(target_os = "macos"))]
-mod platform {
-    use super::*;
-    use std::fs;
-    use std::io::Write;
+fn load_from_file() -> Result<Option<Vec<u8>>> {
+    let p = secret_path()?;
+    if !p.exists() {
+        return Ok(None);
+    }
+    Ok(Some(fs::read(p)?))
+}
+
+fn store_to_file(secret: &[u8]) -> Result<()> {
+    let p = secret_path()?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::path::PathBuf;
-
-    fn path() -> Result<PathBuf> {
-        let dir = dirs::data_dir()
-            .context("no data dir")?
-            .join("Rivault");
-        fs::create_dir_all(&dir).ok();
-        Ok(dir.join("ipc-key"))
-    }
-
-    pub fn load() -> Result<Option<Vec<u8>>> {
-        let p = path()?;
-        if !p.exists() {
-            return Ok(None);
-        }
-        Ok(Some(fs::read(p)?))
-    }
-
-    pub fn store(secret: &[u8]) -> Result<()> {
-        let p = path()?;
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut f = opts.open(&p)?;
-        f.write_all(secret)?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn purge() -> Result<()> {
-        let p = path()?;
-        if p.exists() {
-            std::fs::remove_file(p)?;
-        }
-        Ok(())
-    }
+    opts.mode(0o600);
+    let mut f = opts.open(&p)?;
+    f.write_all(secret)?;
+    Ok(())
 }
+
+/// Process-wide cache: the secret is immutable for a daemon's lifetime.
+static SECRET: OnceLock<Vec<u8>> = OnceLock::new();
 
 /// Load the per-install secret, or generate + persist a new one.
+/// Result is cached in a process-wide OnceLock so disk is accessed at most once.
 pub fn load_or_create_secret() -> Result<Vec<u8>> {
-    if let Some(existing) = platform::load()? {
+    if let Some(cached) = SECRET.get() {
+        return Ok(cached.clone());
+    }
+    let secret = fetch_or_create()?;
+    let _ = SECRET.set(secret.clone());
+    Ok(secret)
+}
+
+fn fetch_or_create() -> Result<Vec<u8>> {
+    if let Some(existing) = load_from_file()? {
         if existing.len() >= KEY_LEN {
             return Ok(existing);
         }
@@ -115,7 +71,7 @@ pub fn load_or_create_secret() -> Result<Vec<u8>> {
     }
     let mut bytes = vec![0u8; KEY_LEN];
     rand::thread_rng().fill_bytes(&mut bytes);
-    platform::store(&bytes).context("persist new IPC secret")?;
+    store_to_file(&bytes).context("persist new IPC secret")?;
     Ok(bytes)
 }
 
