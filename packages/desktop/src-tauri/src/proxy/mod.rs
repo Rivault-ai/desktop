@@ -285,6 +285,15 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "proxy-authenticate"
             | "proxy-authorization"
             | "te"
+            // RFC 7230 §4.4 spells the response header `Trailer`
+            // (singular). Stripping it matters when the proxy
+            // rewrites the body — the upstream-declared trailers
+            // won't be present after our rewrite, and a client that
+            // honours `Trailer` would hang waiting. The plural
+            // `trailers` is also accepted because it can appear as a
+            // value of `TE` in HTTP/1.1; keeping both names in the
+            // match keeps the strip defensive.
+            | "trailer"
             | "trailers"
             | "transfer-encoding"
             | "upgrade"
@@ -809,6 +818,48 @@ mod tests {
         assert!(is_hop_by_hop("transfer-encoding"));
         assert!(!is_hop_by_hop("authorization"));
         assert!(!is_hop_by_hop("content-type"));
+    }
+
+    #[test]
+    fn hop_by_hop_filter_excludes_trailer_and_te() {
+        // Both names must be stripped: the proxy rewrites bodies
+        // (envelope → plaintext), so any upstream-declared `Trailer:`
+        // won't be present in the rewritten response and a strict
+        // client would hang waiting for it. Same shape of bug as the
+        // Content-Length mismatch that caused the v0.2.5 poll-timeout.
+        assert!(is_hop_by_hop("Trailer"));
+        assert!(is_hop_by_hop("trailer"));
+        assert!(is_hop_by_hop("Trailers"));
+        assert!(is_hop_by_hop("TE"));
+        assert!(is_hop_by_hop("te"));
+    }
+
+    #[test]
+    fn build_axum_response_strips_trailer_and_te() {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("trailer"),
+            HeaderValue::from_static("X-Custom-Hash"),
+        );
+        headers.insert(
+            HeaderName::from_static("te"),
+            HeaderValue::from_static("trailers"),
+        );
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+
+        let resp = build_axum_response(StatusCode::OK, headers, b"{}".to_vec());
+        let out = resp.headers();
+        assert!(!out.contains_key("trailer"), "Trailer must be stripped");
+        assert!(!out.contains_key("te"), "TE must be stripped");
+        assert_eq!(
+            out.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "non-hop-by-hop headers must survive"
+        );
     }
 
     #[test]
