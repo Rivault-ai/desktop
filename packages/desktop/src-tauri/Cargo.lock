@@ -3803,6 +3803,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "notify",
  "once_cell",
  "p256",
