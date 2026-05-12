@@ -341,6 +341,9 @@ fn upstream_error(e: anyhow::Error) -> axum::response::Response {
         .into_response()
 }
 
+// NOTE: NOT `deny_unknown_fields`. The backend defines this response and may
+// add fields the daemon doesn't yet understand (e.g. `label`, `category`);
+// silently ignoring them keeps decode forward-compatible.
 #[derive(Deserialize)]
 struct L1Body {
     value: Option<String>,
