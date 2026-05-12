@@ -20,11 +20,13 @@
 
 use anyhow::Result;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
 use crate::daemon::allowlist::all_default_roots;
@@ -44,13 +46,40 @@ const DEBOUNCE_MS: u64 = 500;
 /// plaintext appended afterward.
 const STABILITY_MS: u64 = 200;
 
+/// Tauri event name the desktop UI listens for to surface persistent
+/// scrub failures. Frontend in `packages/desktop/src/App.tsx` listens
+/// on this exact string.
+pub const SCANNER_FAILURE_EVENT: &str = "rivault://scanner-failure";
+
+/// How many consecutive failures on the same path must accumulate
+/// before we surface the banner. Three keeps the UI quiet for
+/// transient blips (a permission glitch during a logout, a brief
+/// `mkdir` race in a fresh runtime) while still firing fast enough
+/// for genuinely stuck files.
+pub const FAILURE_THRESHOLD: u32 = 3;
+
+/// Payload sent to the frontend on a persistent scrub failure.
+/// `consecutive` matches `FAILURE_THRESHOLD` on the first emit; if
+/// failures keep accumulating, the counter keeps rising so the UI
+/// can show the duration of the stall.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScannerFailurePayload {
+    pub path: String,
+    pub error: String,
+    pub consecutive: u32,
+}
+
 /// Spawn the scanner. Returns once the watcher thread is alive; the
 /// thread runs for the daemon's lifetime.
 ///
 /// `scrub_mutex` is shared with `Daemon` so the scanner serializes with
 /// per-release `scrub_paths` and doesn't race the targeted scrubber on
 /// the same file.
-pub fn spawn(index: Arc<RecentReleasesIndex>, scrub_mutex: Arc<Mutex<()>>) {
+pub fn spawn(
+    index: Arc<RecentReleasesIndex>,
+    scrub_mutex: Arc<Mutex<()>>,
+    app: Option<AppHandle>,
+) {
     let roots = all_default_roots();
     if roots.is_empty() {
         tracing::info!("cross-runtime scanner: no allowlist roots — skipping");
@@ -65,7 +94,7 @@ pub fn spawn(index: Arc<RecentReleasesIndex>, scrub_mutex: Arc<Mutex<()>>) {
     std::thread::Builder::new()
         .name("rivault-cross-runtime-scanner".into())
         .spawn(move || {
-            if let Err(e) = run(roots, index, scrub_mutex) {
+            if let Err(e) = run(roots, index, scrub_mutex, app) {
                 tracing::warn!("cross-runtime scanner exited: {e:#}");
             }
         })
@@ -76,6 +105,7 @@ fn run(
     roots: Vec<PathBuf>,
     index: Arc<RecentReleasesIndex>,
     scrub_mutex: Arc<Mutex<()>>,
+    app: Option<AppHandle>,
 ) -> Result<()> {
     let (tx_evt, rx_evt) = channel::<notify::Result<Event>>();
     let mut watcher = notify::recommended_watcher(move |res| {
@@ -100,6 +130,7 @@ fn run(
     }
 
     let mut pending: HashMap<PathBuf, PendingEntry> = HashMap::new();
+    let mut failures: HashMap<PathBuf, u32> = HashMap::new();
     loop {
         // Block briefly for the next event; if we have a pending debounce,
         // wake up to flush it.
@@ -131,7 +162,7 @@ fn run(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => return Ok(()),
         }
-        flush_debounced(&mut pending, &index, &scrub_mutex);
+        flush_debounced(&mut pending, &mut failures, &index, &scrub_mutex, app.as_ref());
     }
 }
 
@@ -160,8 +191,10 @@ fn is_candidate(p: &Path) -> bool {
 
 fn flush_debounced(
     pending: &mut HashMap<PathBuf, PendingEntry>,
+    failures: &mut HashMap<PathBuf, u32>,
     index: &Arc<RecentReleasesIndex>,
     scrub_mutex: &Arc<Mutex<()>>,
+    app: Option<&AppHandle>,
 ) {
     if pending.is_empty() {
         return;
@@ -225,8 +258,12 @@ fn flush_debounced(
     let _guard = scrub_mutex.blocking_lock_owned();
     for p in ready {
         match scrub_for_index(&p, &needles) {
-            Ok(0) => {}
+            Ok(0) => {
+                // No-op success — clear any prior failure streak.
+                failures.remove(&p);
+            }
             Ok(hits) => {
+                failures.remove(&p);
                 tracing::info!(
                     path = %p.display(),
                     redactions = hits,
@@ -234,13 +271,46 @@ fn flush_debounced(
                 );
             }
             Err(e) => {
+                let err_str = format!("{e:#}");
                 tracing::warn!(
                     path = %p.display(),
-                    error = %e,
+                    error = %err_str,
                     "cross-runtime scanner scrub failed",
                 );
+                if let Some(payload) = record_failure(failures, &p, err_str) {
+                    if let Some(app) = app {
+                        if let Err(e) = app.emit(SCANNER_FAILURE_EVENT, &payload) {
+                            tracing::debug!(
+                                "failed to emit scanner-failure event: {e:#}",
+                            );
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+/// Increment the consecutive-failure counter for `path` and return a
+/// payload when the threshold is crossed. The first emit fires at
+/// `FAILURE_THRESHOLD`; subsequent emits fire on every additional
+/// failure so a stuck file keeps surfacing (with a rising counter)
+/// rather than going silent after the initial banner.
+fn record_failure(
+    failures: &mut HashMap<PathBuf, u32>,
+    path: &Path,
+    error: String,
+) -> Option<ScannerFailurePayload> {
+    let count = failures.entry(path.to_path_buf()).or_insert(0);
+    *count += 1;
+    if *count >= FAILURE_THRESHOLD {
+        Some(ScannerFailurePayload {
+            path: path.display().to_string(),
+            error,
+            consecutive: *count,
+        })
+    } else {
+        None
     }
 }
 
@@ -327,7 +397,7 @@ mod tests {
                 last_stat_at: Some(now), // observed "now" → 0ms stable
             },
         );
-        flush_debounced(&mut pending, &index, &scrub_mutex);
+        flush_debounced(&mut pending, &mut HashMap::new(), &index, &scrub_mutex, None);
         assert!(
             pending.contains_key(&path),
             "stat just observed; must defer until STABILITY_MS elapses"
@@ -344,7 +414,7 @@ mod tests {
                 last_stat_at: Some(long_ago),
             },
         );
-        flush_debounced(&mut pending, &index, &scrub_mutex);
+        flush_debounced(&mut pending, &mut HashMap::new(), &index, &scrub_mutex, None);
         assert!(
             !pending.contains_key(&path),
             "stable file past STABILITY_MS must flush and drop the entry"
@@ -363,7 +433,7 @@ mod tests {
                 last_stat_at: Some(long_ago),
             },
         );
-        flush_debounced(&mut pending, &index, &scrub_mutex);
+        flush_debounced(&mut pending, &mut HashMap::new(), &index, &scrub_mutex, None);
         let entry = pending.get(&path).expect("size mismatch must defer");
         assert_eq!(entry.last_stat, Some(s0), "stat updated to current file");
     }
@@ -384,10 +454,50 @@ mod tests {
                 last_stat_at: None,
             },
         );
-        flush_debounced(&mut pending, &index, &scrub_mutex);
+        flush_debounced(&mut pending, &mut HashMap::new(), &index, &scrub_mutex, None);
         assert!(
             !pending.contains_key(&ghost),
             "missing file must be removed from pending instead of stalling forever"
         );
+    }
+
+    /// Direct test of the failure-counter threshold logic. Avoids
+    /// running the scanner thread or trying to coax scrub_for_index into
+    /// failing; we just want to lock in: the first two failures emit
+    /// nothing, the third returns a payload, subsequent failures keep
+    /// returning rising-`consecutive` payloads, and a success between
+    /// failures resets the streak.
+    #[test]
+    fn record_failure_emits_on_third_consecutive() {
+        let mut failures: HashMap<PathBuf, u32> = HashMap::new();
+        let p = PathBuf::from("/tmp/rivault-test-failure.jsonl");
+
+        assert!(record_failure(&mut failures, &p, "io1".into()).is_none());
+        assert!(record_failure(&mut failures, &p, "io2".into()).is_none());
+        let third = record_failure(&mut failures, &p, "io3".into())
+            .expect("third failure must emit");
+        assert_eq!(third.consecutive, FAILURE_THRESHOLD);
+        assert_eq!(third.error, "io3");
+        assert_eq!(third.path, p.display().to_string());
+
+        let fourth = record_failure(&mut failures, &p, "io4".into())
+            .expect("subsequent failures keep emitting with rising count");
+        assert_eq!(fourth.consecutive, FAILURE_THRESHOLD + 1);
+    }
+
+    #[test]
+    fn record_failure_separate_paths_have_independent_counters() {
+        let mut failures: HashMap<PathBuf, u32> = HashMap::new();
+        let a = PathBuf::from("/tmp/a.jsonl");
+        let b = PathBuf::from("/tmp/b.jsonl");
+        // Two failures on `a` and two on `b` — both still under threshold.
+        for _ in 0..2 {
+            assert!(record_failure(&mut failures, &a, "err".into()).is_none());
+            assert!(record_failure(&mut failures, &b, "err".into()).is_none());
+        }
+        // Third failure on `a` crosses, but `b` is unaffected.
+        let payload = record_failure(&mut failures, &a, "err".into()).unwrap();
+        assert_eq!(payload.consecutive, FAILURE_THRESHOLD);
+        assert_eq!(payload.path, a.display().to_string());
     }
 }
