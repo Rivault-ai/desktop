@@ -365,6 +365,12 @@ pub fn run() {
                 tracing::warn!("recover_unscrubbed: {e:#}");
             }
 
+            // Spin up the cross-runtime transcript scanner now that we have an
+            // `AppHandle`. The scanner uses the handle to emit a
+            // `rivault://scanner-failure` Tauri event on persistent scrub
+            // failures so the UI can surface them as a banner.
+            daemon.start_cross_runtime_scanner(Some(app.handle().clone()));
+
             // Auto-import: if there is no Rivault config but OpenClaw already
             // has a working API key, save it now so the user skips Setup.
             // Best-effort: any failure logs and falls through.

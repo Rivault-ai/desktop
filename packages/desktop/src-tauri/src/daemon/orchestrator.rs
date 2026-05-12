@@ -87,18 +87,27 @@ impl Daemon {
                 RecentReleasesIndex::default()
             }),
         );
-        // Spin up the single long-running watcher that redacts cross-
-        // session leaks (e.g. a value released in session A that later
-        // shows up in session B's transcript via a different MCP). The
-        // scanner shares `scrub_mutex` so it doesn't race per-release
-        // scrubs on the same file.
-        cross_runtime_scanner::spawn(Arc::clone(&recent_index), Arc::clone(&scrub_mutex));
         Self {
             ledger,
             open_releases: Arc::new(Mutex::new(HashMap::new())),
             scrub_mutex,
             recent_index,
         }
+    }
+
+    /// Spin up the single long-running watcher that redacts cross-session
+    /// leaks across every runtime's transcript root. Split out from
+    /// `Daemon::new` so the `AppHandle` (only available inside Tauri's
+    /// setup closure) can flow in for `cross_runtime_scanner` to emit
+    /// persistent-failure events to the UI. `None` is supported for
+    /// headless / test contexts; the scanner still runs, it just doesn't
+    /// surface failures in a banner.
+    pub fn start_cross_runtime_scanner(&self, app: Option<tauri::AppHandle>) {
+        cross_runtime_scanner::spawn(
+            Arc::clone(&self.recent_index),
+            Arc::clone(&self.scrub_mutex),
+            app,
+        );
     }
 
     pub fn ledger(&self) -> &Ledger {

@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import Setup from "./Setup";
+import { Alert, AlertTitle, AlertDescription } from "./components/ui/alert";
 import rivaultLogo from "./assets/rivault-logo-wide.svg";
 import "./App.css";
 
@@ -38,6 +40,16 @@ interface DaemonStatus {
   http_port: number | null;
   browser_token_prefix: string;
   websocket_configured: boolean;
+}
+
+// Payload shape emitted by the cross-runtime scanner when a single
+// transcript path has failed to scrub three times in a row. Mirrors
+// `ScannerFailurePayload` in
+// `packages/desktop/src-tauri/src/daemon/cross_runtime_scanner.rs`.
+interface ScannerFailure {
+  path: string;
+  error: string;
+  consecutive: number;
 }
 
 interface ConfigStatus {
@@ -86,6 +98,30 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
+  const [scannerFailure, setScannerFailure] = useState<ScannerFailure | null>(
+    null,
+  );
+
+  // Cross-runtime scanner persistent-failure banner. The Rust side
+  // (`daemon/cross_runtime_scanner.rs::record_failure`) emits this
+  // event after three consecutive scrub failures on the same path.
+  // We hold the most recent payload for 30s so the operator has time
+  // to see it without leaving a permanently-stuck banner.
+  useEffect(() => {
+    let timeout: number | undefined;
+    const unlistenPromise = listen<ScannerFailure>(
+      "rivault://scanner-failure",
+      (e) => {
+        setScannerFailure(e.payload);
+        if (timeout !== undefined) window.clearTimeout(timeout);
+        timeout = window.setTimeout(() => setScannerFailure(null), 30_000);
+      },
+    );
+    return () => {
+      if (timeout !== undefined) window.clearTimeout(timeout);
+      unlistenPromise.then((fn) => fn()).catch(() => {});
+    };
+  }, []);
 
   // Auto-import toast: fires once when the daemon imported an OpenClaw key at startup.
   useEffect(() => {
@@ -156,6 +192,24 @@ export default function App() {
 
   return (
     <div className="app">
+      {scannerFailure && (
+        <Alert variant="destructive" className="m-4">
+          <div className="flex-1 min-w-0">
+            <AlertTitle>Scrub failure ({scannerFailure.consecutive}× in a row)</AlertTitle>
+            <AlertDescription>
+              <code className="break-all">{scannerFailure.path}</code>
+              <div className="text-xs opacity-80 mt-1">{scannerFailure.error}</div>
+            </AlertDescription>
+          </div>
+          <button
+            type="button"
+            onClick={() => setScannerFailure(null)}
+            className="ml-2 text-xs underline"
+          >
+            dismiss
+          </button>
+        </Alert>
+      )}
       {toast && <div className="toast">{toast}</div>}
       <header>
         <div className="header-row">
