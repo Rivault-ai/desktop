@@ -17,7 +17,63 @@ use base64::{
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+/// Read a transcript file rejecting symlinks at the final path component.
+///
+/// `allowlist::validate_path` canonicalises the longest existing prefix
+/// before we ever call the scrubber, but there's still a TOCTOU window
+/// between that canonicalise and the actual open here. A same-UID
+/// attacker who can race the daemon could swap the leaf for a symlink
+/// pointing outside the allowlist root; on Unix, `O_NOFOLLOW` makes the
+/// open fail in that case rather than redacting (or, worse, leaking
+/// redactions to) an unintended file.
+///
+/// Returns `Ok(None)` when the path is missing or unreadable so callers
+/// can treat the file as "best-effort gone" without surfacing the
+/// O_NOFOLLOW kind specifically — matching the existing scrubber
+/// behaviour of degrading silently on missing files.
+#[cfg(unix)]
+fn read_no_follow(path: &Path) -> io::Result<Vec<u8>> {
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+#[cfg(not(unix))]
+fn read_no_follow(path: &Path) -> io::Result<Vec<u8>> {
+    fs::read(path)
+}
+
+/// Write a transcript file rejecting a leaf-symlink swap mid-scrub.
+///
+/// Uses `O_NOFOLLOW` so an attacker who replaces the file with a
+/// symlink between the read and write phases of a scrub can't redirect
+/// the write to a path outside the allowlist. We don't pass
+/// `O_CREAT` — the file must already exist (the read above proved
+/// that), so a leaf that's gone between read and write becomes an
+/// `ENOENT` rather than silently re-creating the original location.
+#[cfg(unix)]
+fn write_no_follow(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_no_follow(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    fs::write(path, bytes)
+}
 
 use crate::ledger::ScrubAnchors;
 
@@ -335,9 +391,9 @@ pub fn scrub_for_index(path: &Path, needles: &[String]) -> Result<usize> {
     if needles.is_empty() {
         return Ok(0);
     }
-    let bytes = match fs::read(path) {
+    let bytes = match read_no_follow(path) {
         Ok(b) => b,
-        Err(_) => return Ok(0), // file disappeared mid-event; best-effort
+        Err(_) => return Ok(0), // file disappeared mid-event or became a symlink
     };
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return Ok(0); // skip binary content
@@ -352,7 +408,7 @@ pub fn scrub_for_index(path: &Path, needles: &[String]) -> Result<usize> {
         }
     }
     if hits > 0 {
-        fs::write(path, s.as_bytes())?;
+        write_no_follow(path, s.as_bytes())?;
     }
     Ok(hits)
 }
@@ -438,7 +494,7 @@ fn scrub_runtime_wide(
         if !path.exists() {
             continue;
         }
-        let bytes = match fs::read(path) {
+        let bytes = match read_no_follow(path) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -461,7 +517,7 @@ fn scrub_runtime_wide(
             hit_count += to_redact;
         }
         if hit_count > 0 {
-            fs::write(path, s.as_bytes())?;
+            write_no_follow(path, s.as_bytes())?;
             report.files_modified.push(path.display().to_string());
             report.total_replacements += hit_count;
         }
@@ -525,7 +581,7 @@ fn verify_with_precounts(
         if !path.exists() {
             continue;
         }
-        let Ok(bytes) = fs::read(path) else {
+        let Ok(bytes) = read_no_follow(path) else {
             continue;
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -570,9 +626,9 @@ fn scrub_one(
     start: u64,
     report: &mut ScrubReport,
 ) -> Result<()> {
-    let bytes = match fs::read(path) {
+    let bytes = match read_no_follow(path) {
         Ok(b) => b,
-        Err(_) => return Ok(()), // best effort; skip unreadable
+        Err(_) => return Ok(()), // best effort; skip unreadable or symlinked
     };
     // Truncation / rotation guard: if the file shrunk below our snapshot,
     // the original task-window suffix is gone. Whatever's there now is
@@ -602,7 +658,7 @@ fn scrub_one(
         let mut out = Vec::with_capacity(prefix.len() + s.len());
         out.extend_from_slice(prefix);
         out.extend_from_slice(s.as_bytes());
-        fs::write(path, out)?;
+        write_no_follow(path, &out)?;
         report.files_modified.push(path.display().to_string());
         report.total_replacements += hits;
     }
@@ -662,7 +718,7 @@ fn verify_dir(
 }
 
 fn verify_one(path: &Path, needles: &[String], start: u64) -> Result<bool> {
-    let Ok(bytes) = fs::read(path) else {
+    let Ok(bytes) = read_no_follow(path) else {
         return Ok(true);
     };
     let effective_start = if (start as usize) <= bytes.len() {
@@ -705,6 +761,55 @@ mod tests {
             files_precount: HashMap::new(),
             sqlite: HashMap::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_no_follow_rejects_symlink_at_leaf() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        fs::write(&target, "agent transcript content").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&target, &link).unwrap();
+
+        // Direct read through the helper must refuse to follow the symlink
+        // — this is the TOCTOU defence: by the time the scrubber opens the
+        // path, an attacker may have swapped the leaf for a symlink
+        // pointing outside the allowlist.
+        let err = read_no_follow(&link).expect_err("expected ELOOP / O_NOFOLLOW failure");
+        // io::ErrorKind::FilesystemLoop is still unstable, so match on the
+        // raw OS errno. ELOOP is the POSIX-defined return for `open` with
+        // O_NOFOLLOW when the leaf is a symlink — verified on macOS and
+        // Linux.
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "got {err:?}; expected ELOOP"
+        );
+
+        // Reading the real path still works.
+        let bytes = read_no_follow(&target).unwrap();
+        assert_eq!(bytes, b"agent transcript content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scrub_for_index_skips_symlinked_path() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("foreign.jsonl");
+        fs::write(&target, "secret123 lives here").unwrap();
+        let link = dir.path().join("transcript.jsonl");
+        symlink(&target, &link).unwrap();
+
+        // scrub_for_index degrades gracefully (0 hits) when the path is
+        // a symlink — the file is NOT mutated and the foreign target is
+        // untouched.
+        let hits = scrub_for_index(&link, &["secret123".to_string()]).unwrap();
+        assert_eq!(hits, 0);
+        let after = fs::read_to_string(&target).unwrap();
+        assert_eq!(after, "secret123 lives here", "symlinked target must not be redacted");
     }
 
     #[test]

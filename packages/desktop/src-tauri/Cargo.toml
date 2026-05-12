@@ -38,6 +38,7 @@ base64 = "0.22"
 urlencoding = "2"
 subtle = "2"
 rand = "0.8"
+libc = "0.2"
 
 # Envelope crypto for L2 vault items (P-256 ECDH + HKDF-SHA256 + AES-256-GCM)
 # matching `packages/api/src/lib/envelope.ts` on the Rivault backend.
