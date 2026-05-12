@@ -12,7 +12,7 @@ use serde::Serialize;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize)]
@@ -46,5 +46,12 @@ pub fn write(http_port: Option<u16>, socket_path: &str, hmac_key: &[u8]) -> Resu
     opts.mode(0o600);
     let mut f = opts.open(&p)?;
     f.write_all(&json)?;
+    // `OpenOptions::mode` only sets the mode on file *creation* — if a
+    // previous installer left the file with a wider mode, the daemon
+    // would otherwise inherit it and the skill's integrity check would
+    // refuse to read it. Explicitly re-tighten on every write.
+    #[cfg(unix)]
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o600))
+        .context("tighten daemon.json mode to 0600")?;
     Ok(())
 }
