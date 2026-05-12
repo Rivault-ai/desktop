@@ -74,7 +74,19 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(ledger: Ledger) -> Self {
         let scrub_mutex = Arc::new(tokio::sync::Mutex::new(()));
-        let recent_index = Arc::new(RecentReleasesIndex::default());
+        // Try to open the persistent recent-releases store so cross-runtime
+        // scanning has its needle list ready after a daemon restart. Falls
+        // back to in-memory only on any init failure (keychain unavailable,
+        // disk write-locked, etc.) — operational fail-open: scrub coverage
+        // narrows but the daemon still runs.
+        let recent_index = Arc::new(
+            RecentReleasesIndex::open_default().unwrap_or_else(|e| {
+                tracing::warn!(
+                    "recent_releases: persistence init failed ({e:#}); using in-memory fallback"
+                );
+                RecentReleasesIndex::default()
+            }),
+        );
         // Spin up the single long-running watcher that redacts cross-
         // session leaks (e.g. a value released in session A that later
         // shows up in session B's transcript via a different MCP). The
