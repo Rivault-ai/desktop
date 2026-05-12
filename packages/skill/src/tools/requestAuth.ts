@@ -6,6 +6,7 @@ import type { Tool, ToolResult } from './types.js'
 import { textResult } from './types.js'
 import type { RivaultClient } from '../client.js'
 import { getCurrentSessionId } from '../lib/sessionId.js'
+import { redactApiKey } from '../lib/redactApiKey.js'
 
 function spawnBackgroundPoller(
   apiKey: string,
@@ -67,7 +68,7 @@ export function createRequestAuthTool(client: RivaultClient): Tool {
 
         const apiKey = client.getApiKey()
         const apiBaseUrl = client.getBaseUrl()
-        appendFileSync(logFile, `[rivault] apiKey="${apiKey ? apiKey.substring(0, 10) + '...' : 'EMPTY'}" authRequestId=${result.authRequestId}\n`)
+        appendFileSync(logFile, `[rivault] apiKey="${redactApiKey(apiKey)}" authRequestId=${result.authRequestId}\n`)
 
         // Extract the URL token from the auth URL (e.g. https://rivault.ai/a/<token>)
         const urlToken = result.authUrl?.split('/a/')[1] ?? ''
