@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -223,7 +223,13 @@ impl KeypairStore {
             .to_pkcs8_der()
             .context("encode secret to PKCS#8 DER")?;
         let mut iv = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut iv);
+        // OsRng draws straight from the OS CSPRNG (`getentropy` on macOS /
+        // `/dev/urandom` elsewhere) for every call. `rand::thread_rng()`
+        // is a thread-local ChaCha that reseeds periodically — fine in
+        // isolation, but under thread-pool reuse + high concurrency it's
+        // hard to rule out an IV collision across two wraps under the
+        // same wrap key, which is catastrophic in AES-GCM.
+        OsRng.fill_bytes(&mut iv);
         let cipher = Aes256Gcm::new(wrap_key.into());
         let nonce = Nonce::from_slice(&iv);
         let ct = cipher
