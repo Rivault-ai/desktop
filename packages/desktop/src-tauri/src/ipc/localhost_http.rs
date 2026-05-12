@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-use super::auth::verify;
+use time::OffsetDateTime;
+
+use super::auth::{freshness_ok, verify};
 use super::IpcContext;
 use crate::daemon::orchestrator::StopScope;
 use crate::daemon::release::ReleaseEvent;
@@ -47,6 +49,11 @@ struct StopBody {
     release_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    /// ISO 8601 timestamp the caller produced this body at. Bounded
+    /// against the daemon's clock by `auth::freshness_ok` (60s window)
+    /// so a captured (body, signature) pair can't be replayed
+    /// indefinitely.
+    timestamp: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -133,6 +140,19 @@ async fn release(
                 .into_response();
         }
     };
+    // Replay guard: ReleaseEvent already carries `released_at` (ISO
+    // 8601), so we don't add a new field — we just enforce that the
+    // value lands inside the 60s window. A captured HMAC payload
+    // becomes inert one minute after it was first produced.
+    if !freshness_ok(&event.released_at, OffsetDateTime::now_utc()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrBody {
+                error: "released_at outside replay window".into(),
+            }),
+        )
+            .into_response();
+    }
     match ctx.daemon.clone().accept(event, Channel::Localhost) {
         Ok(release_id) => (StatusCode::OK, Json(AcceptOk { release_id })).into_response(),
         Err(e) => (
@@ -182,6 +202,15 @@ async fn stop(
                 .into_response();
         }
     };
+    if !freshness_ok(&req.timestamp, OffsetDateTime::now_utc()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrBody {
+                error: "timestamp outside replay window".into(),
+            }),
+        )
+            .into_response();
+    }
     let scope = StopScope {
         release_id: req.release_id,
         session_id: req.session_id,
