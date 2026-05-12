@@ -20,6 +20,8 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::mcp::RuntimeNonceMap;
+
 /// Logical identifier per runtime; the on-disk entry name in each
 /// agent's config. We standardise on `"rivault"` so users can find
 /// it consistently.
@@ -46,20 +48,22 @@ pub fn probe_status() -> McpInstallStatus {
 }
 
 /// Build the MCP URL for a specific runtime. Each runtime registers its
-/// own URL with a `?runtime=` query param — the daemon's MCP server
-/// reads that param at tool-call time to set the right transcript
-/// directory and ledger `agent_runtime` tag. Without the param, every
-/// caller would be tagged with the daemon's bake-in default and the
-/// transcript-path resolver would pick the wrong session file.
-pub fn mcp_url_for(http_port: u16, runtime: &str) -> String {
-    format!("http://127.0.0.1:{http_port}/mcp?runtime={runtime}")
-}
-
-/// Legacy MCP URL (no runtime param). Kept for callers that don't know
-/// or don't care which runtime is asking. The daemon falls back to its
-/// bake-in default when the param is absent.
-pub fn mcp_url(http_port: u16) -> String {
-    format!("http://127.0.0.1:{http_port}/mcp")
+/// own URL with a `?nonce=<hex>` query param derived from the per-install
+/// IPC secret. At tool-call time the daemon looks the nonce up in its
+/// `RuntimeNonceMap` to authenticate the caller and pick the right
+/// transcript directory + ledger `agent_runtime` tag.
+///
+/// Panics in debug builds if `runtime` is outside the canonical set
+/// (`claude_code`, `claude_desktop`, `codex`, `openclaw`); release builds
+/// fall through to an empty nonce, which the daemon rejects at request
+/// time — the install attempt fails loudly instead of silently writing a
+/// URL that can never authenticate.
+pub fn mcp_url_for(http_port: u16, runtime: &str, nonces: &RuntimeNonceMap) -> String {
+    let nonce = nonces.nonce_for(runtime).unwrap_or_else(|| {
+        debug_assert!(false, "no nonce registered for runtime {runtime:?}");
+        ""
+    });
+    format!("http://127.0.0.1:{http_port}/mcp?nonce={nonce}")
 }
 
 /// Decide whether a per-runtime install should write, skip, or no-op.
@@ -111,28 +115,29 @@ fn log_skip(runtime: &str, existing: &str) {
 
 /// Auto-install on every supported runtime whose config file exists.
 ///
-/// Called by the daemon at startup once the HTTP port is bound.
+/// Called by the daemon at startup once the HTTP port is bound and the
+/// nonce table has been derived from the per-install secret.
 /// Idempotent: each per-runtime `install()` short-circuits to NoOp if
 /// the entry already points at the right URL, and Skip if the user has
 /// a non-localhost value.
-pub fn auto_install(http_port: u16) {
+pub fn auto_install(http_port: u16, nonces: &RuntimeNonceMap) {
     if claude_code::config_exists() {
-        if let Err(e) = claude_code::install(http_port) {
+        if let Err(e) = claude_code::install(http_port, nonces) {
             tracing::warn!("claude_code auto-install: {e:#}");
         }
     }
     if claude_desktop::config_exists() {
-        if let Err(e) = claude_desktop::install(http_port) {
+        if let Err(e) = claude_desktop::install(http_port, nonces) {
             tracing::warn!("claude_desktop auto-install: {e:#}");
         }
     }
     if codex::config_exists() {
-        if let Err(e) = codex::install(http_port) {
+        if let Err(e) = codex::install(http_port, nonces) {
             tracing::warn!("codex auto-install: {e:#}");
         }
     }
     if openclaw::config_exists() {
-        if let Err(e) = openclaw::install(http_port) {
+        if let Err(e) = openclaw::install(http_port, nonces) {
             tracing::warn!("openclaw auto-install: {e:#}");
         }
     }
@@ -161,9 +166,9 @@ pub mod claude_code {
         Ok(v.pointer(&format!("/mcpServers/{ENTRY_NAME}")).is_some())
     }
 
-    pub fn install(http_port: u16) -> Result<()> {
+    pub fn install(http_port: u16, nonces: &RuntimeNonceMap) -> Result<()> {
         let p = config_path()?;
-        let target = super::mcp_url_for(http_port, "claude_code");
+        let target = super::mcp_url_for(http_port, "claude_code", nonces);
         let root_text = if p.exists() {
             fs::read_to_string(&p)?
         } else {
@@ -252,12 +257,12 @@ pub mod claude_desktop {
         Ok(v.pointer(&format!("/mcpServers/{ENTRY_NAME}")).is_some())
     }
 
-    pub fn install(http_port: u16) -> Result<()> {
+    pub fn install(http_port: u16, nonces: &RuntimeNonceMap) -> Result<()> {
         let p = config_path()?;
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).ok();
         }
-        let target = super::mcp_url_for(http_port, "claude_desktop");
+        let target = super::mcp_url_for(http_port, "claude_desktop", nonces);
         let mut root: Value = if p.exists() {
             let text = fs::read_to_string(&p)?;
             serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
@@ -367,12 +372,12 @@ pub mod codex {
             .any(|line| line.trim_start() == "[mcp_servers.rivault]")
     }
 
-    pub fn install(http_port: u16) -> Result<()> {
+    pub fn install(http_port: u16, nonces: &RuntimeNonceMap) -> Result<()> {
         let p = config_path()?;
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).ok();
         }
-        let url = super::mcp_url_for(http_port, "codex");
+        let url = super::mcp_url_for(http_port, "codex", nonces);
         let target_block = format!(
             "{BEGIN}\n[mcp_servers.{ENTRY_NAME}]\nurl = \"{url}\"\n{END}\n",
         );
@@ -502,9 +507,11 @@ pub mod openclaw {
     /// `skills.entries.rivault` if present. No-ops if the key isn't
     /// there or the file doesn't exist.
     ///
-    /// Signature still takes `http_port` for API symmetry with the
-    /// other runtimes' `install(port)` calls — the value is unused.
-    pub fn install(_http_port: u16) -> Result<()> {
+    /// Signature still takes `http_port` and the nonce map for API
+    /// symmetry with the other runtimes' `install(port, nonces)` calls —
+    /// the values are unused because the OpenClaw skill auto-discovers
+    /// the daemon URL via the discovery file.
+    pub fn install(_http_port: u16, _nonces: &RuntimeNonceMap) -> Result<()> {
         uninstall()
     }
 
@@ -582,15 +589,26 @@ mod tests {
         }
     }
 
+    /// Stable nonce table for tests so URLs are reproducible across
+    /// runs — every test uses the same per-install secret.
+    fn test_nonces() -> RuntimeNonceMap {
+        RuntimeNonceMap::from_secret(&[0x42u8; 32])
+    }
+
+    fn nonce(runtime: &str) -> String {
+        test_nonces().nonce_for(runtime).unwrap().to_string()
+    }
+
     #[test]
     fn claude_code_install_then_uninstall_round_trips() {
         let home = fresh_home();
         with_home(home.path(), || {
+            let n = test_nonces();
             assert!(!claude_code::probe().unwrap());
-            claude_code::install(47318).unwrap();
+            claude_code::install(47318, &n).unwrap();
             assert!(claude_code::probe().unwrap());
             // Idempotent re-install
-            claude_code::install(47318).unwrap();
+            claude_code::install(47318, &n).unwrap();
             assert!(claude_code::probe().unwrap());
             claude_code::uninstall().unwrap();
             assert!(!claude_code::probe().unwrap());
@@ -610,7 +628,7 @@ mod tests {
                 r#"{"mcpServers":{"other":{"url":"http://example.com"}},"settings":{"theme":"dark"}}"#,
             )
             .unwrap();
-            claude_code::install(47318).unwrap();
+            claude_code::install(47318, &test_nonces()).unwrap();
             let after = fs::read_to_string(&p).unwrap();
             // Both entries present, settings unchanged.
             assert!(after.contains("\"other\""));
@@ -628,19 +646,26 @@ mod tests {
     fn codex_install_uses_managed_block() {
         let home = fresh_home();
         with_home(home.path(), || {
+            let n = test_nonces();
             // User-authored TOML before our block.
             let p = home.path().join(".codex").join("config.toml");
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(&p, "model = \"o4-mini\"\n").unwrap();
-            codex::install(47318).unwrap();
+            codex::install(47318, &n).unwrap();
             let after = fs::read_to_string(&p).unwrap();
+            let codex_nonce = nonce("codex");
             assert!(after.contains("model = \"o4-mini\""));
             assert!(after.contains("[mcp_servers.rivault]"));
-            assert!(after.contains("http://127.0.0.1:47318/mcp?runtime=codex"));
-            // Re-install replaces the managed block in place.
-            codex::install(47319).unwrap();
+            assert!(after.contains(&format!(
+                "http://127.0.0.1:47318/mcp?nonce={codex_nonce}"
+            )));
+            // Re-install replaces the managed block in place when the
+            // port changes — same nonce, different port.
+            codex::install(47319, &n).unwrap();
             let after = fs::read_to_string(&p).unwrap();
-            assert!(after.contains("http://127.0.0.1:47319/mcp?runtime=codex"));
+            assert!(after.contains(&format!(
+                "http://127.0.0.1:47319/mcp?nonce={codex_nonce}"
+            )));
             assert!(!after.contains("47318"));
             // Uninstall strips just our block.
             codex::uninstall().unwrap();
@@ -665,7 +690,7 @@ mod tests {
             .unwrap();
             assert!(!openclaw::probe().unwrap(), "legacy apiUrl present pre-cleanup");
 
-            openclaw::install(47318).unwrap();
+            openclaw::install(47318, &test_nonces()).unwrap();
 
             let v: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
@@ -690,7 +715,7 @@ mod tests {
             .unwrap();
             let mtime_before = fs::metadata(&p).unwrap().modified().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(20));
-            openclaw::install(47318).unwrap();
+            openclaw::install(47318, &test_nonces()).unwrap();
             let mtime_after = fs::metadata(&p).unwrap().modified().unwrap();
             assert_eq!(
                 mtime_before, mtime_after,
@@ -703,7 +728,7 @@ mod tests {
     fn openclaw_install_no_op_when_file_absent() {
         let home = fresh_home();
         with_home(home.path(), || {
-            openclaw::install(47318).unwrap();
+            openclaw::install(47318, &test_nonces()).unwrap();
             let p = home.path().join(".openclaw").join("openclaw.json");
             assert!(!p.exists(), "install must not create openclaw.json");
         });
@@ -721,7 +746,7 @@ mod tests {
             )
             .unwrap();
             // Auto-install must NOT clobber it.
-            claude_code::install(47318).unwrap();
+            claude_code::install(47318, &test_nonces()).unwrap();
             let v: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
             assert_eq!(
@@ -736,21 +761,23 @@ mod tests {
         let home = fresh_home();
         with_home(home.path(), || {
             // Previous run picked a different port; new run uses 47320.
-            // Also covers the "no-runtime-param" → "with-runtime-param"
-            // migration: an older daemon binary wrote `/mcp` without the
-            // query param, the new one must overwrite to add it.
+            // Also covers the "old URL with no query param" → "new URL
+            // with nonce" migration: an older daemon binary wrote `/mcp`
+            // alone (or with the unauthenticated `?runtime=`); the new
+            // one must overwrite to embed the nonce.
             let p = home.path().join(".claude.json");
             fs::write(
                 &p,
                 r#"{"mcpServers":{"rivault":{"type":"http","url":"http://127.0.0.1:47318/mcp"}}}"#,
             )
             .unwrap();
-            claude_code::install(47320).unwrap();
+            claude_code::install(47320, &test_nonces()).unwrap();
+            let cc_nonce = nonce("claude_code");
             let v: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
             assert_eq!(
                 v["mcpServers"]["rivault"]["url"],
-                "http://127.0.0.1:47320/mcp?runtime=claude_code"
+                format!("http://127.0.0.1:47320/mcp?nonce={cc_nonce}")
             );
         });
     }
@@ -760,17 +787,20 @@ mod tests {
         let home = fresh_home();
         with_home(home.path(), || {
             let p = home.path().join(".claude.json");
-            // Pre-existing file, exactly the URL we'd write (with runtime
+            // Pre-existing file, exactly the URL we'd write (with nonce
             // param present).
+            let cc_nonce = nonce("claude_code");
             fs::write(
                 &p,
-                r#"{"mcpServers":{"rivault":{"type":"http","url":"http://127.0.0.1:47318/mcp?runtime=claude_code"}}}"#,
+                format!(
+                    r#"{{"mcpServers":{{"rivault":{{"type":"http","url":"http://127.0.0.1:47318/mcp?nonce={cc_nonce}"}}}}}}"#
+                ),
             )
             .unwrap();
             let mtime_before = fs::metadata(&p).unwrap().modified().unwrap();
             // Sleep enough that any rewrite would land at a later mtime.
             std::thread::sleep(std::time::Duration::from_millis(20));
-            claude_code::install(47318).unwrap();
+            claude_code::install(47318, &test_nonces()).unwrap();
             let mtime_after = fs::metadata(&p).unwrap().modified().unwrap();
             // No-op path must not touch the file at all.
             assert_eq!(
@@ -792,7 +822,7 @@ mod tests {
                 "model = \"o4-mini\"\n\n[mcp_servers.rivault]\nurl = \"https://rivault.corp.example.com/mcp\"\n",
             )
             .unwrap();
-            codex::install(47318).unwrap();
+            codex::install(47318, &test_nonces()).unwrap();
             let after = fs::read_to_string(&p).unwrap();
             // Original entry intact; no managed block appended.
             assert!(after.contains("rivault.corp.example.com"));
@@ -816,7 +846,7 @@ mod tests {
                 r#"{"skills":{"entries":{"rivault":{"enabled":true,"apiKey":"rv_live_xxx","apiUrl":"http://127.0.0.1:99999"}}}}"#,
             )
             .unwrap();
-            openclaw::install(47318).unwrap();
+            openclaw::install(47318, &test_nonces()).unwrap();
             let v: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
             let entry = &v["skills"]["entries"]["rivault"];
