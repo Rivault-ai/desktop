@@ -1,7 +1,7 @@
 ---
 name: rivault
-version: 0.2.7
-updatedAt: 2026-05-11T07:15:01Z
+version: 0.3.0
+updatedAt: 2026-05-12T23:00:00Z
 description: "User's encrypted personal vault. MUST be activated for ANY task needing user data: filling forms, signups, logins, purchases, bookings, messages. Provides emails, phone numbers, names, addresses, passwords, API keys, payment info, credentials. Always search vault before asking user for anything."
 metadata:
   { "openclaw": { "emoji": "🔐", "requires": { "env": ["RIVAULT_API_KEY"] }, "primaryEnv": "RIVAULT_API_KEY", "always": true, "priority": "critical", "prerequisite": true, "activateWith": ["*"] } }
@@ -69,6 +69,22 @@ Then pick the right flow:
 - Only missing (nothing in vault) → use **Request Form** (section 5)
 
 **CRITICAL:** Always combine all L2 items AND all missing items into a SINGLE request. Never create multiple separate requests.
+
+### Rule 2.5: Always pass `website` when the task is tied to a specific site
+
+Any `rivault_get_secret`, `rivault_request_auth`, `rivault_request_form`, or `rivault_request_hybrid` call MUST include the `website` parameter whenever the task is tied to a specific site (a signup, login, purchase, form fill, etc. on a known domain). In curl bodies, set `"website":"DOMAIN"`; in JS plugin tool calls, pass `website: "DOMAIN"`.
+
+`DOMAIN` should be the site you're using the data on — eTLD+1 is preferred (e.g. `"amazon.com"`) but URLs and subdomains work too; the server normalizes to root domain. Examples:
+
+- Filling a signup at `https://www.airbnb.com/host/welcome` → `"website":"airbnb.com"`
+- Buying on Nike's mobile site → `"website":"nike.com"`
+- Pure CLI task with no website (e.g. "what's my GitHub username?") → omit `website`.
+
+What this does:
+- For `rivault_get_secret` (L1) and `rivault_request_auth` (L2): appends `DOMAIN` to the vault item's **Used on** history. The user can audit every site their data has been used on.
+- For `rivault_request_form` and `rivault_request_hybrid`: pre-populates the **Added for** field on the form page so newly created items are tagged with the right origin without the user typing it.
+
+Same `website` value across multiple calls in the same task is fine — the server dedupes. Pass it on every call; the user's audit log is only as good as what agents send.
 
 ### Rule 3: After creating the request — send the URL, END your response
 
@@ -232,8 +248,10 @@ Empty results means the item is not in the vault. Run this for EVERY piece of da
 ```bash
  curl -s --max-time 15 \
   -H "Authorization: Bearer $RIVAULT_API_KEY" \
-  "${RIVAULT_API_URL:-https://api.rivault.ai}/agent/vault/ITEM_ID"
+  "${RIVAULT_API_URL:-https://api.rivault.ai}/agent/vault/ITEM_ID?website=DOMAIN"
 ```
+
+Pass `?website=DOMAIN` whenever the retrieval is tied to a specific site (Rule 2.5). The server appends `DOMAIN` to the item's **Used on** history. Omit only for site-less tasks.
 
 **L1 response:** `{ "value": "...", "label": "..." }`
 **L2 response:** `{ "requires_auth": true, "sensitivity_level": 2, "label": "..." }` → use Request Auth instead.
@@ -258,7 +276,7 @@ process.stdout.write(kp.publicKey.export({format:'der',type:'spki'}).toString('b
 RESP=$( curl -s --max-time 15 -X POST \
   -H "Authorization: Bearer $RIVAULT_API_KEY" \
   -H "Content-Type: application/json" \
-  -d "{\"itemId\":\"ITEM_ID\",\"reason\":\"REASON\",\"agentEphemeralPublicKey\":\"$RV_PUBKEY\",\"callbackSessionId\":\"$SESSION_ID\"}" \
+  -d "{\"itemId\":\"ITEM_ID\",\"reason\":\"REASON\",\"website\":\"DOMAIN\",\"agentEphemeralPublicKey\":\"$RV_PUBKEY\",\"callbackSessionId\":\"$SESSION_ID\"}" \
   "${RIVAULT_API_URL:-https://api.rivault.ai}/agent/auth-request")
 
 # Move private key to authRequestId-keyed location
@@ -266,6 +284,8 @@ RV_ID=$(echo "$RESP" | jq -r '.authRequestId')
 mv "$PRIV_FILE_TMP" "/tmp/rv_priv_$RV_ID"
 echo "$RESP"
 ```
+
+Include `"website":"DOMAIN"` per Rule 2.5 whenever the auth is tied to a specific site. The server appends it to the item's **Used on** history and renders an "Authorizing agent access on `DOMAIN`" banner on the user's auth page.
 
 **Response:** `{ "authRequestId": "...", "authUrl": "...", "expiresAt": "...", "agentMessage": "..." }`
 
@@ -323,9 +343,11 @@ SESSION_ID=$(cat ~/.openclaw/agents/main/sessions/sessions.json 2>/dev/null | jq
  curl -s --max-time 15 -X POST \
   -H "Authorization: Bearer $RIVAULT_API_KEY" \
   -H "Content-Type: application/json" \
-  -d "{\"requestedLabel\":\"LABEL\",\"requestedCategory\":\"CATEGORY\",\"reason\":\"REASON\",\"callbackSessionId\":\"$SESSION_ID\"}" \
+  -d "{\"requestedLabel\":\"LABEL\",\"requestedCategory\":\"CATEGORY\",\"reason\":\"REASON\",\"website\":\"DOMAIN\",\"callbackSessionId\":\"$SESSION_ID\"}" \
   "${RIVAULT_API_URL:-https://api.rivault.ai}/agent/form-request"
 ```
+
+Include `"website":"DOMAIN"` per Rule 2.5 whenever the form is being collected for a specific site. The server pre-populates the **Added for** field on the user's form page so the saved vault item is tagged with the right origin.
 
 **Response:** `{ "formRequestId": "...", "formUrl": "...", "expiresAt": "...", "agentMessage": "..." }`
 
@@ -372,6 +394,7 @@ RESP=$( curl -s --max-time 15 -X POST \
     "authItemIds": ["ITEM_ID_1", "ITEM_ID_2"],
     "formFields": [{"key": "field_key", "label": "Field Label"}],
     "reason": "REASON",
+    "website": "DOMAIN",
     "agentEphemeralPublicKey": "'"$RV_PUBKEY"'",
     "callbackSessionId": "'"$SESSION_ID"'"
   }' \
@@ -382,7 +405,7 @@ mv "$PRIV_FILE_TMP" "/tmp/rv_priv_$RV_ID"
 echo "$RESP"
 ```
 
-Include ALL L2 item IDs in `authItemIds` and ALL missing fields in `formFields`. Do not leave any out.
+Include ALL L2 item IDs in `authItemIds` and ALL missing fields in `formFields`. Do not leave any out. Pass `"website":"DOMAIN"` per Rule 2.5 — it both pre-populates **Added for** on newly collected items and appends to **Used on** for every authorized item.
 
 **Response:** `{ "hybridRequestId": "...", "hybridUrl": "...", "expiresAt": "...", "agentMessage": "..." }`
 
@@ -474,10 +497,12 @@ fs.chmodSync(process.argv[1], 0o600);
 process.stdout.write(kp.publicKey.export({format:'der',type:'spki'}).toString('base64'));
 " "$PRIV_FILE_TMP")
 
- # Request authorization for the chosen login item
+ # Request authorization for the chosen login item. Per Rule 2.5, include
+ # "website":"DOMAIN" — even though the login item already has its own
+ # website, this also tags the item's "Used on" history.
 RESP=$( curl -s --max-time 15 -H "Authorization: Bearer $RIVAULT_API_KEY" \
   -H "Content-Type: application/json" \
-  -X POST -d "{\"itemId\":\"ITEM_ID\",\"reason\":\"Logging in to DOMAIN\",\"agentEphemeralPublicKey\":\"$RV_PUBKEY\"}" \
+  -X POST -d "{\"itemId\":\"ITEM_ID\",\"reason\":\"Logging in to DOMAIN\",\"website\":\"DOMAIN\",\"agentEphemeralPublicKey\":\"$RV_PUBKEY\"}" \
   "${RIVAULT_API_URL:-https://api.rivault.ai}/agent/auth-request")
 RV_ID=$(echo "$RESP" | jq -r '.authRequestId')
 mv "$PRIV_FILE_TMP" "/tmp/rv_priv_$RV_ID"
