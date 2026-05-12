@@ -606,7 +606,7 @@ User sees TWO separate messages (30s apart):
 - ALL vault values (L1 and L2) must NEVER be written to persistent storage (files, memory, session history, logs)
 - Use retrieved values only in-memory for the single operation, then discard
 - After the operation, do not reference or summarize the secret value
-- If a secret was written to any file, replace it with `[REDACTED]` immediately
+- If a secret was written to any file, replace it with `[REDACTED:rivault]` immediately
 - Always use `reason` parameter to explain why you need each item
 
 ### Bash + Curl Security
@@ -641,11 +641,23 @@ For EACH secret value from curl output, run:
 ```bash
 SESSION_FILE=$(ls -t ~/.openclaw/agents/main/sessions/*.jsonl 2>/dev/null | head -1)
 if [ -n "$SESSION_FILE" ]; then
-  sed -i '' 's/SECRET_VALUE_HERE/[REDACTED]/g' "$SESSION_FILE"
+  SECRET='SECRET_VALUE_HERE' python3 -c '
+import os, sys
+secret = os.environ["SECRET"]
+for path in sys.argv[1:]:
+    with open(path, "r") as fh:
+        data = fh.read()
+    new = data.replace(secret, "[REDACTED:rivault]")
+    if new != data:
+        with open(path, "w") as fh:
+            fh.write(new)
+' "$SESSION_FILE"
 fi
 ```
 
 Replace `SECRET_VALUE_HERE` with each actual plaintext value. Run once per value.
+
+The redaction uses a byte-literal `str.replace`, not a regex, so any secret value works — including ones containing `/`, `.`, `&`, `[`, `]`, `$`, `^`, `*`, or `\` that would silently break a `sed` substitution. The marker `[REDACTED:rivault]` matches what the daemon writes when it scrubs files itself, so transcripts read consistently regardless of which side did the scrub.
 
 For login credentials retrieved via the auth or login flows, redact BOTH the `username` and the `password` (`value`) fields — usernames are saved L1 server-side but should still not appear in session transcripts.
 
