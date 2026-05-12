@@ -128,10 +128,17 @@ Run this block ONCE at the top of any Rivault-using bash flow before any curl:
 ```bash
 DAEMON_JSON="${HOME}/Library/Application Support/Rivault/daemon.json"
 if [ -z "${RIVAULT_API_URL:-}" ] && [ -r "$DAEMON_JSON" ]; then
-  PORT=$(awk -F'[:,}]' '/"http_port"/{gsub(/[^0-9]/,"",$2); print $2}' "$DAEMON_JSON" | head -1)
-  if [ -n "$PORT" ]; then
-    export RIVAULT_API_URL="http://127.0.0.1:$PORT"
-  fi
+  # Use jq (already required for the other curl pipelines below). The
+  # earlier awk parser silently returned garbage when the file was
+  # pretty-printed differently than expected; jq fails closed and the
+  # `case` validates the result is a 1-5 digit number in the IANA
+  # registered/dynamic ranges before we ever bind it into the URL.
+  PORT=$(jq -r '.http_port // empty' "$DAEMON_JSON" 2>/dev/null)
+  case "$PORT" in
+    [1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-5][0-9][0-9][0-9][0-9]|6[0-4][0-9][0-9][0-9]|65[0-4][0-9][0-9]|655[0-2][0-9]|6553[0-5])
+      export RIVAULT_API_URL="http://127.0.0.1:$PORT"
+      ;;
+  esac
 fi
 export RIVAULT_API_URL="${RIVAULT_API_URL:-https://api.rivault.ai}"
 ```
