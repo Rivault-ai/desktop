@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 
 use crate::daemon::allowlist::all_default_roots;
@@ -35,6 +35,14 @@ use crate::scrubber::{build_needles, scrub_for_index};
 /// single scan. The agent runtime writes one JSONL line at a time, so
 /// a multi-line tool result can produce ~50 events in a few ms.
 const DEBOUNCE_MS: u64 = 500;
+
+/// Additional EOF-stability window: even after the debounce elapses, the
+/// scanner stats the file and waits for `(size, mtime)` to be unchanged
+/// for this long before scrubbing. Closes a race where a multi-line
+/// tool result writes one line every ~600ms — the debounce alone would
+/// fire on the first quiet gap and scan a partial file, missing
+/// plaintext appended afterward.
+const STABILITY_MS: u64 = 200;
 
 /// Spawn the scanner. Returns once the watcher thread is alive; the
 /// thread runs for the daemon's lifetime.
@@ -91,7 +99,7 @@ fn run(
         }
     }
 
-    let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
+    let mut pending: HashMap<PathBuf, PendingEntry> = HashMap::new();
     loop {
         // Block briefly for the next event; if we have a pending debounce,
         // wake up to flush it.
@@ -113,7 +121,10 @@ fn run(
                     if !is_candidate(&path) {
                         continue;
                     }
-                    pending.insert(path, now);
+                    pending
+                        .entry(path)
+                        .and_modify(|e| e.last_event = now)
+                        .or_insert_with(|| PendingEntry::new(now));
                 }
             }
             Ok(Err(e)) => tracing::trace!("cross-runtime scanner notify err: {e}"),
@@ -124,12 +135,31 @@ fn run(
     }
 }
 
+/// State for a single transcript path waiting to be scrubbed. Tracks
+/// both the last-event timestamp (debounce timer) and the most recent
+/// stat result (EOF-stability timer).
+struct PendingEntry {
+    last_event: Instant,
+    last_stat: Option<(u64, SystemTime)>,
+    last_stat_at: Option<Instant>,
+}
+
+impl PendingEntry {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_event: now,
+            last_stat: None,
+            last_stat_at: None,
+        }
+    }
+}
+
 fn is_candidate(p: &Path) -> bool {
     p.extension().and_then(|e| e.to_str()) == Some("jsonl") && p.is_file()
 }
 
 fn flush_debounced(
-    pending: &mut HashMap<PathBuf, Instant>,
+    pending: &mut HashMap<PathBuf, PendingEntry>,
     index: &Arc<RecentReleasesIndex>,
     scrub_mutex: &Arc<Mutex<()>>,
 ) {
@@ -137,11 +167,43 @@ fn flush_debounced(
         return;
     }
     let now = Instant::now();
-    let deadline = Duration::from_millis(DEBOUNCE_MS);
-    let ready: Vec<PathBuf> = pending
-        .iter()
-        .filter_map(|(p, ts)| (now.duration_since(*ts) >= deadline).then(|| p.clone()))
-        .collect();
+    let debounce = Duration::from_millis(DEBOUNCE_MS);
+    let stability = Duration::from_millis(STABILITY_MS);
+
+    let mut ready: Vec<PathBuf> = Vec::new();
+    let mut to_remove: Vec<PathBuf> = Vec::new();
+
+    for (path, entry) in pending.iter_mut() {
+        // Step 1: debounce — must be `DEBOUNCE_MS` since the last event.
+        if now.duration_since(entry.last_event) < debounce {
+            continue;
+        }
+        // Step 2: EOF-stability — stat the file, defer if size or mtime
+        // changed since the last check, scrub once it's been quiet for
+        // `STABILITY_MS`. A missing file is treated as "settled" so we
+        // remove it from `pending` without scrubbing.
+        let stat = match std::fs::metadata(path) {
+            Ok(m) => (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
+            Err(_) => {
+                to_remove.push(path.clone());
+                continue;
+            }
+        };
+        match (entry.last_stat, entry.last_stat_at) {
+            (Some(prev), Some(prev_ts)) if prev == stat => {
+                if now.duration_since(prev_ts) >= stability {
+                    ready.push(path.clone());
+                }
+            }
+            _ => {
+                entry.last_stat = Some(stat);
+                entry.last_stat_at = Some(now);
+            }
+        }
+    }
+    for p in &to_remove {
+        pending.remove(p);
+    }
     if ready.is_empty() {
         return;
     }
@@ -229,5 +291,103 @@ mod tests {
         let after = fs::read_to_string(&f).unwrap();
         assert!(after.contains(REDACTION_MARKER));
         assert!(!after.contains("demo@rivault.ai"));
+    }
+
+    /// Pure unit test for the debounce + stability decision. Builds a
+    /// `pending` map by hand and asserts which paths a flush would
+    /// promote to the "scrub now" list. Avoids spinning up a notify
+    /// watcher or sleeping; instead we mint `Instant`s by subtracting
+    /// from `now`.
+    #[test]
+    fn flush_requires_stability_after_debounce() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        fs::write(&path, "first line\n").unwrap();
+        let stat0 = fs::metadata(&path).unwrap();
+        let s0 = (
+            stat0.len(),
+            stat0.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        );
+
+        let now = Instant::now();
+        let long_ago = now - Duration::from_millis(DEBOUNCE_MS + STABILITY_MS + 50);
+        let just_after_debounce = now - Duration::from_millis(DEBOUNCE_MS + 10);
+
+        let index = Arc::new(RecentReleasesIndex::default());
+        let scrub_mutex = Arc::new(Mutex::new(()));
+
+        // Case 1: debounce satisfied, but stat was just observed → not
+        // yet stable, must remain pending.
+        let mut pending = HashMap::new();
+        pending.insert(
+            path.clone(),
+            PendingEntry {
+                last_event: just_after_debounce,
+                last_stat: Some(s0),
+                last_stat_at: Some(now), // observed "now" → 0ms stable
+            },
+        );
+        flush_debounced(&mut pending, &index, &scrub_mutex);
+        assert!(
+            pending.contains_key(&path),
+            "stat just observed; must defer until STABILITY_MS elapses"
+        );
+
+        // Case 2: debounce satisfied AND stat unchanged long enough →
+        // ready to flush (and gets removed).
+        let mut pending = HashMap::new();
+        pending.insert(
+            path.clone(),
+            PendingEntry {
+                last_event: long_ago,
+                last_stat: Some(s0),
+                last_stat_at: Some(long_ago),
+            },
+        );
+        flush_debounced(&mut pending, &index, &scrub_mutex);
+        assert!(
+            !pending.contains_key(&path),
+            "stable file past STABILITY_MS must flush and drop the entry"
+        );
+
+        // Case 3: stale stat from a previous observation no longer
+        // matches the current file (size grew between checks) → stat is
+        // replaced and the entry stays pending for another stability
+        // window.
+        let mut pending = HashMap::new();
+        pending.insert(
+            path.clone(),
+            PendingEntry {
+                last_event: long_ago,
+                last_stat: Some((s0.0 + 999, s0.1)), // pretend last stat saw a different size
+                last_stat_at: Some(long_ago),
+            },
+        );
+        flush_debounced(&mut pending, &index, &scrub_mutex);
+        let entry = pending.get(&path).expect("size mismatch must defer");
+        assert_eq!(entry.last_stat, Some(s0), "stat updated to current file");
+    }
+
+    #[test]
+    fn flush_drops_path_when_file_disappears() {
+        let dir = TempDir::new().unwrap();
+        let ghost = dir.path().join("vanished.jsonl");
+        let index = Arc::new(RecentReleasesIndex::default());
+        let scrub_mutex = Arc::new(Mutex::new(()));
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            ghost.clone(),
+            PendingEntry {
+                last_event: Instant::now() - Duration::from_secs(1),
+                last_stat: None,
+                last_stat_at: None,
+            },
+        );
+        flush_debounced(&mut pending, &index, &scrub_mutex);
+        assert!(
+            !pending.contains_key(&ghost),
+            "missing file must be removed from pending instead of stalling forever"
+        );
     }
 }
