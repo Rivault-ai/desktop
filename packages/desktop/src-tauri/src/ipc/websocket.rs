@@ -60,6 +60,7 @@ async fn run(ctx: IpcContext, url: String) {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Envelope {
     signature: String,
     payload: serde_json::Value,

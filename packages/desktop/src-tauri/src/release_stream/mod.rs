@@ -30,6 +30,9 @@ use crate::mcp::transcript::resolve_transcript_paths;
 const MIN_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_BACKOFF: Duration = Duration::from_secs(120);
 
+// NOTE: NOT `deny_unknown_fields`. The backend defines the SSE schema and may
+// add fields before the daemon catches up; tolerating extras keeps an
+// older daemon binary functional across backend deploys.
 #[derive(Debug, Deserialize)]
 struct StreamEvent {
     #[serde(rename = "itemId")]

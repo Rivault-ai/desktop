@@ -41,6 +41,7 @@ struct ErrBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StopBody {
     #[serde(default)]
     release_id: Option<String>,
