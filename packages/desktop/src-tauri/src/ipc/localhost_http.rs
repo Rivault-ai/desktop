@@ -18,6 +18,8 @@ use tokio::net::TcpListener;
 
 use time::OffsetDateTime;
 
+use subtle::ConstantTimeEq;
+
 use super::auth::{freshness_ok, verify};
 use super::IpcContext;
 use crate::daemon::orchestrator::StopScope;
@@ -116,7 +118,21 @@ async fn release(
 
     let hmac_ok =
         !signature.is_empty() && verify(ctx.secret.as_slice(), body.as_bytes(), signature);
-    let token_ok = !token.is_empty() && token == ctx.browser_token.as_str();
+    // Constant-time comparison so the wall-clock duration of a wrong
+    // token doesn't reveal how many leading bytes matched. `subtle::ct_eq`
+    // requires equal-length slices to return Choice(1); length mismatch
+    // is short-circuited to false, which is the right answer anyway.
+    let token_ok = if token.is_empty() {
+        false
+    } else {
+        match ctx.browser_token.read() {
+            Ok(stored) => {
+                token.len() == stored.len()
+                    && bool::from(token.as_bytes().ct_eq(stored.as_bytes()))
+            }
+            Err(_) => false,
+        }
+    };
 
     if !hmac_ok && !token_ok {
         return (
@@ -152,6 +168,22 @@ async fn release(
             }),
         )
             .into_response();
+    }
+    // Browser-channel rotation: the moment a token-authenticated call
+    // makes it past every other check (HMAC pairs would have skipped
+    // the `token_ok` arm entirely), mint a fresh token and replace the
+    // stored one. Captured (header, body) pairs become inert on the
+    // next request. Hold the write lock only for the swap.
+    if token_ok && !hmac_ok {
+        match ctx.browser_token.write() {
+            Ok(mut stored) => {
+                *stored = crate::keychain::one_time_token();
+                tracing::info!("browser token rotated after successful release");
+            }
+            Err(e) => tracing::warn!(
+                "browser token rotate skipped (lock poisoned): {e}"
+            ),
+        }
     }
     match ctx.daemon.clone().accept(event, Channel::Localhost) {
         Ok(release_id) => (StatusCode::OK, Json(AcceptOk { release_id })).into_response(),
@@ -227,3 +259,159 @@ async fn stop(
     let fired = ctx.daemon.trigger_stop(&scope);
     (StatusCode::OK, Json(StopOk { fired })).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as AxumRequest;
+    use std::sync::RwLock;
+    use time::format_description::well_known::Rfc3339;
+    use tower::ServiceExt;
+
+    use crate::daemon::Daemon;
+    use crate::ledger::Ledger;
+
+    fn test_ctx(initial_token: &str) -> Arc<IpcContext> {
+        let daemon = Arc::new(Daemon::new(Ledger::open_in_memory().unwrap()));
+        Arc::new(IpcContext {
+            daemon,
+            secret: Arc::new(vec![0u8; 32]),
+            browser_token: Arc::new(RwLock::new(initial_token.to_string())),
+        })
+    }
+
+    fn fresh_release_body(release_id: &str) -> String {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        format!(
+            "{{\"release_id\":\"{rid}\",\"session_id\":\"s1\",\"tier\":\"l1\",\"agent_runtime\":\"openclaw\",\"mcp_mode\":null,\"value_plaintext\":null,\"value_hash\":\"h\",\"encoded_variants\":[],\"transcript_paths\":[],\"released_at\":\"{ts}\",\"rotation_supported\":false}}",
+            rid = release_id,
+            ts = now,
+        )
+    }
+
+    fn test_router(ctx: Arc<IpcContext>) -> Router {
+        Router::new().route("/release", post(release)).with_state(ctx)
+    }
+
+    #[tokio::test]
+    async fn browser_token_rotates_after_successful_release() {
+        let initial = "x".repeat(64);
+        let ctx = test_ctx(&initial);
+        let router = test_router(Arc::clone(&ctx));
+
+        let resp = router
+            .clone()
+            .oneshot(
+                AxumRequest::builder()
+                    .method("POST")
+                    .uri("/release")
+                    .header("X-Rivault-Token", initial.as_str())
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(fresh_release_body("rls_one")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "first call with valid token must succeed; got {}",
+            resp.status()
+        );
+
+        let stored_after = ctx.browser_token.read().unwrap().clone();
+        assert_ne!(stored_after, initial, "token MUST rotate after success");
+        assert_eq!(stored_after.len(), initial.len(), "shape preserved");
+    }
+
+    #[tokio::test]
+    async fn old_browser_token_returns_401_after_rotation() {
+        let initial = "y".repeat(64);
+        let ctx = test_ctx(&initial);
+        let router = test_router(Arc::clone(&ctx));
+
+        let _first = router
+            .clone()
+            .oneshot(
+                AxumRequest::builder()
+                    .method("POST")
+                    .uri("/release")
+                    .header("X-Rivault-Token", initial.as_str())
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(fresh_release_body("rls_a")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let replay = router
+            .oneshot(
+                AxumRequest::builder()
+                    .method("POST")
+                    .uri("/release")
+                    .header("X-Rivault-Token", initial.as_str())
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(fresh_release_body("rls_b")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn invalid_browser_token_returns_401_and_does_not_rotate() {
+        let initial = "z".repeat(64);
+        let ctx = test_ctx(&initial);
+        let router = test_router(Arc::clone(&ctx));
+
+        let resp = router
+            .oneshot(
+                AxumRequest::builder()
+                    .method("POST")
+                    .uri("/release")
+                    .header("X-Rivault-Token", "wrong-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(fresh_release_body("rls_x")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let stored_after = ctx.browser_token.read().unwrap().clone();
+        assert_eq!(stored_after, initial, "rejected calls must not rotate");
+    }
+
+    #[tokio::test]
+    async fn token_length_mismatch_is_constant_time_safe() {
+        let initial = "0".repeat(64);
+        let ctx = test_ctx(&initial);
+        let router = test_router(Arc::clone(&ctx));
+
+        let bogus_lens = ["0".to_string(), "0".repeat(63), "0".repeat(65), "0".repeat(128)];
+        for bogus in &bogus_lens {
+            let resp = router
+                .clone()
+                .oneshot(
+                    AxumRequest::builder()
+                        .method("POST")
+                        .uri("/release")
+                        .header("X-Rivault-Token", bogus.as_str())
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(fresh_release_body("rls_l")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "bogus token length {} must 401",
+                bogus.len(),
+            );
+        }
+        let stored_after = ctx.browser_token.read().unwrap().clone();
+        assert_eq!(stored_after, initial);
+    }
+}
+

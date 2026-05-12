@@ -16,12 +16,17 @@ pub mod unix_socket;
 pub mod websocket;
 
 use crate::daemon::Daemon;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
 pub struct IpcContext {
     pub daemon: Arc<Daemon>,
     pub secret: Arc<Vec<u8>>,
-    /// Localhost HTTP one-time browser token, rotated on app launch.
-    pub browser_token: Arc<String>,
+    /// Localhost HTTP one-time browser token. Wrapped in `RwLock` so the
+    /// `/release` handler can rotate it the moment a browser-channel
+    /// request authenticates successfully — making the token genuinely
+    /// one-time-use. Read-heavy access (every browser POST takes the
+    /// read lock to compare); writes happen at most once per successful
+    /// call.
+    pub browser_token: Arc<RwLock<String>>,
 }

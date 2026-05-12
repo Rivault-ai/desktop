@@ -73,7 +73,12 @@ async fn daemon_status(state: tauri::State<'_, AppState>) -> Result<DaemonStatus
     Ok(DaemonStatus {
         socket_path: ipc::unix_socket::socket_path().display().to_string(),
         http_port: state.http_port,
-        browser_token_prefix: state.ipc.browser_token.chars().take(8).collect(),
+        browser_token_prefix: state
+            .ipc
+            .browser_token
+            .read()
+            .map(|t| t.chars().take(8).collect::<String>())
+            .unwrap_or_default(),
         websocket_configured: std::env::var_os("RIVAULT_DAEMON_WS_URL").is_some(),
     })
 }
@@ -352,7 +357,7 @@ pub fn run() {
             let ipc = IpcContext {
                 daemon: Arc::clone(&daemon),
                 secret: Arc::new(secret),
-                browser_token: Arc::new(browser_token),
+                browser_token: Arc::new(std::sync::RwLock::new(browser_token)),
             };
 
             // Recover orphaned releases from a prior run.
