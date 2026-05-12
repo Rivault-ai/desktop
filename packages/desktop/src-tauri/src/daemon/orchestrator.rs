@@ -231,6 +231,12 @@ impl Daemon {
             trigger_that_fired: None,
             scrub_verified: false,
         };
+        // Audit anchor: this call MUST stay error-propagating. An earlier
+        // version of this code unwrapped here and crashed the spawn task
+        // on rare serde/SQLite errors. `?` keeps the orchestrator's
+        // failure mode an Err return on the synchronous caller, never a
+        // panic. See `ledger::tests::duplicate_release_id_returns_ok_no_panic`
+        // for the locked-in regression test.
         self.ledger.insert(&entry).context("ledger insert")?;
 
         // Register the plaintext with the cross-runtime scanner so it can
@@ -276,6 +282,9 @@ impl Daemon {
         let paths = validated.clone();
         let rotation_supported = event.rotation_supported;
 
+        // Spawn task uses `if let Err(e) = …` (NOT `.unwrap()`) so a
+        // lifecycle failure logs and returns rather than poisoning the
+        // tokio worker. Audit-anchored — do not introduce `.unwrap()` here.
         tokio::spawn(async move {
             if let Err(e) = me
                 .run_lifecycle(

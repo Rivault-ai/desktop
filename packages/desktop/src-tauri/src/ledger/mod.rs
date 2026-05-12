@@ -396,6 +396,30 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_release_id_returns_ok_no_panic() {
+        // Regression for an old audit finding that warned the orchestrator
+        // could `.unwrap()` a ledger.insert failure and crash the spawn
+        // task. The orchestrator now propagates errors via `?`; this test
+        // anchors the *ledger's* side of that contract — inserts always
+        // return a `Result`, never panic, even when the row already
+        // exists. The schema's `INSERT OR REPLACE` semantics make a
+        // duplicate `release_id` overwrite cleanly, so the second insert
+        // observes the second entry's contents.
+        let l = Ledger::open_in_memory().unwrap();
+        let mut first = fixture("rls_dup");
+        first.session_id = "first".into();
+        l.insert(&first).expect("first insert returns Ok");
+
+        let mut second = fixture("rls_dup");
+        second.session_id = "second".into();
+        // Must not panic — that's the audit's load-bearing concern.
+        l.insert(&second).expect("duplicate insert returns Ok");
+
+        let got = l.get("rls_dup").unwrap().unwrap();
+        assert_eq!(got.session_id, "second");
+    }
+
+    #[test]
     fn mark_scrubbed_persists() {
         let l = Ledger::open_in_memory().unwrap();
         l.insert(&fixture("rls_2")).unwrap();
