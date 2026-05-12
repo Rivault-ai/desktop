@@ -1,35 +1,11 @@
 import { spawn } from 'child_process'
-import { readFileSync, openSync, appendFileSync } from 'fs'
+import { openSync, appendFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 import type { Tool, ToolResult } from './types.js'
 import { textResult } from './types.js'
 import type { RivaultClient } from '../client.js'
-
-// Cache for getCurrentSessionId — TTL of 5 seconds to avoid repeated disk reads
-let _sessionIdCache: { value: string; expiresAt: number } | null = null
-
-function getCurrentSessionId(): string {
-  const now = Date.now()
-  if (_sessionIdCache && now < _sessionIdCache.expiresAt) {
-    return _sessionIdCache.value
-  }
-  try {
-    const sessionsPath = join(homedir(), '.openclaw/agents/main/sessions/sessions.json')
-    const sessions = JSON.parse(readFileSync(sessionsPath, 'utf-8')) as Record<
-      string,
-      { updatedAt: number; sessionId?: string }
-    >
-    const entries = Object.entries(sessions)
-    entries.sort(([, a], [, b]) => b.updatedAt - a.updatedAt)
-    const value = entries[0]?.[1]?.sessionId ?? entries[0]?.[0] ?? ''
-    _sessionIdCache = { value, expiresAt: now + 5_000 }
-    return value
-  } catch {
-    _sessionIdCache = { value: '', expiresAt: now + 5_000 }
-    return ''
-  }
-}
+import { getCurrentSessionId } from '../lib/sessionId.js'
 
 function spawnBackgroundPoller(
   apiKey: string,
