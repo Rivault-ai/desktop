@@ -41,15 +41,16 @@ use crate::upstream::{
 
 /// Per-instance state for the MCP server. Cloned (cheap — `Arc`s inside)
 /// for every new session by [`StreamableHttpService`].
+///
+/// Runtime is NOT baked into this struct: every inbound request is
+/// authenticated against the per-runtime nonce table by middleware
+/// (`mcp::require_runtime_nonce`), which stashes the matched
+/// `AgentRuntime` in the request's extensions. Tool handlers read it
+/// back via `runtime_from_request` at the point of use.
 #[derive(Clone)]
 pub struct RivaultMcp {
     daemon: Arc<Daemon>,
     upstream: UpstreamClient,
-    /// Runtime label baked into the connection. The desktop setup flow
-    /// passes this when registering the MCP entry per agent — Claude Code
-    /// lands as `claude-code`, Codex as `codex`, etc. Defaults to
-    /// `Custom` when absent (no transcript scrub possible).
-    runtime: AgentRuntime,
     /// Populated and consumed by the `#[tool_router]` / `#[tool_handler]`
     /// macros via reflection — Rust's dead-code analysis can't see that.
     #[allow(dead_code)]
@@ -57,11 +58,10 @@ pub struct RivaultMcp {
 }
 
 impl RivaultMcp {
-    pub fn new(daemon: Arc<Daemon>, upstream: UpstreamClient, runtime: AgentRuntime) -> Self {
+    pub fn new(daemon: Arc<Daemon>, upstream: UpstreamClient) -> Self {
         Self {
             daemon,
             upstream,
-            runtime,
             tool_router: Self::tool_router(),
         }
     }
@@ -980,13 +980,21 @@ impl RivaultMcp {
     ) -> anyhow::Result<()> {
         let release_id = uuid::Uuid::new_v4().to_string();
         let value_hash = hex::encode(Sha256::digest(plaintext.as_bytes()));
-        // Per-session runtime: each runtime registers a different MCP URL
-        // with a `?runtime=` query param (claude_code, codex,
-        // claude_desktop). At tool-call time we read that param off the
-        // request URI and use it for transcript-path resolution + the
-        // ledger row's runtime tag. Fallback: the daemon's bake-in
-        // default (`self.runtime`), which is set at server-mount time.
-        let runtime = runtime_from_request(ctx).unwrap_or_else(|| self.runtime.clone());
+        // Per-session runtime: the daemon's nonce middleware authenticated
+        // this request against the per-runtime nonce table and stashed the
+        // matched `AgentRuntime` in the request extensions. Reading it
+        // back here drives transcript-path resolution + the ledger row's
+        // runtime tag. The middleware rejects requests without a valid
+        // nonce, so a missing extension here is a programmer error in the
+        // wiring — fall back to `Custom` (no allowlist, no scrub) and log
+        // loudly rather than crashing the tool call.
+        let runtime = runtime_from_request(ctx).unwrap_or_else(|| {
+            tracing::error!(
+                "MCP tool call reached log_release without a runtime extension; \
+                 nonce middleware misconfigured"
+            );
+            AgentRuntime::Custom
+        });
         let transcript_paths = resolve_transcript_paths(&runtime);
         let released_at = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -1043,43 +1051,14 @@ fn mcp_session_id(ctx: &RequestContext<RoleServer>) -> String {
 
 /// Per-session runtime detection.
 ///
-/// Each agent runtime is registered with a different MCP URL — the
-/// install commands write `http://127.0.0.1:<port>/mcp?runtime=claude_code`
-/// (or `codex` / `claude_desktop`). At tool-call time we read that
-/// query param off the request URI so the same daemon binary can serve
-/// multiple runtimes correctly: the right transcript directory is used
-/// for path resolution, and the ledger row's `agent_runtime` matches
-/// the agent that actually made the call.
-///
-/// Returns None when the param is absent or unrecognised, so the caller
-/// can fall back to the daemon's bake-in default.
+/// The nonce middleware (`mcp::require_runtime_nonce`) authenticates the
+/// inbound URL's `?nonce=<hex>` against the per-install nonce table and
+/// stashes the matched `AgentRuntime` in the axum request extensions
+/// before the request reaches the MCP service. We retrieve it here for
+/// transcript-path resolution and the ledger row's `agent_runtime` tag.
 fn runtime_from_request(ctx: &RequestContext<RoleServer>) -> Option<AgentRuntime> {
     let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
-    let query = parts.uri.query()?;
-    let value = query.split('&').find_map(|kv| {
-        let mut it = kv.splitn(2, '=');
-        let k = it.next()?;
-        let v = it.next()?;
-        if k == "runtime" {
-            Some(v)
-        } else {
-            None
-        }
-    })?;
-    parse_runtime(value)
-}
-
-fn parse_runtime(s: &str) -> Option<AgentRuntime> {
-    match s {
-        "claude_code" | "claude-code" | "claudecode" => Some(AgentRuntime::ClaudeCode),
-        "claude_desktop" | "claude-desktop" | "claudedesktop" => {
-            Some(AgentRuntime::ClaudeDesktop)
-        }
-        "codex" => Some(AgentRuntime::Codex),
-        "openclaw" => Some(AgentRuntime::Openclaw),
-        "custom" => Some(AgentRuntime::Custom),
-        _ => None,
-    }
+    parts.extensions.get::<AgentRuntime>().cloned()
 }
 
 fn upstream_err(op: &str, e: anyhow::Error) -> McpError {

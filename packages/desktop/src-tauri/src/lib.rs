@@ -38,6 +38,11 @@ pub struct AppState {
     pub daemon: Arc<Daemon>,
     pub ipc: IpcContext,
     pub http_port: Option<u16>,
+    /// Per-runtime nonces gating the MCP endpoint. Setup commands embed
+    /// the matching nonce in each runtime's MCP URL; the daemon rejects
+    /// any inbound request without a valid nonce. See
+    /// `mcp::runtime_nonce` for the derivation.
+    pub nonces: Arc<crate::mcp::RuntimeNonceMap>,
     /// Holds the cancel handle while a passkey pairing flow is active.
     /// `Some(_)` = pairing in progress; `None` = idle.
     pub pairing_cancel: StdMutex<Option<oneshot::Sender<()>>>,
@@ -226,11 +231,12 @@ async fn mcp_install(state: tauri::State<'_, AppState>, runtime: String) -> Resu
     let port = state
         .http_port
         .ok_or_else(|| "daemon HTTP port not bound".to_string())?;
+    let nonces = &state.nonces;
     let res = match runtime.as_str() {
-        "claude_code" => setup::claude_code::install(port),
-        "claude_desktop" => setup::claude_desktop::install(port),
-        "codex" => setup::codex::install(port),
-        "openclaw" => setup::openclaw::install(port),
+        "claude_code" => setup::claude_code::install(port, nonces),
+        "claude_desktop" => setup::claude_desktop::install(port, nonces),
+        "codex" => setup::codex::install(port, nonces),
+        "openclaw" => setup::openclaw::install(port, nonces),
         other => return Err(format!("unknown runtime: {other}")),
     };
     res.map_err(|e| format!("{e:#}"))
@@ -338,6 +344,7 @@ pub fn run() {
         ))
         .setup(move |app| {
             let secret = keychain::load_or_create_secret()?;
+            let nonces = Arc::new(crate::mcp::RuntimeNonceMap::from_secret(&secret));
             let ledger = Ledger::open()?;
             let daemon = Arc::new(Daemon::new(ledger));
             let browser_token = keychain::one_time_token();
@@ -410,12 +417,12 @@ pub fn run() {
                             Ok(client) => Some(crate::mcp::router(
                                 Arc::clone(&daemon),
                                 client,
-                                // Runtime is per-MCP-entry — Setup will
-                                // register separate /mcp paths per agent
-                                // later. For now, OpenClaw is the
-                                // safest default; other runtimes get
-                                // added explicitly via Setup UX.
-                                crate::daemon::release::AgentRuntime::Openclaw,
+                                // Per-runtime nonce authentication: every
+                                // inbound request is matched against this
+                                // table by middleware, which stashes the
+                                // resolved AgentRuntime in the request
+                                // extensions before the handler runs.
+                                Arc::clone(&nonces),
                             )),
                             Err(e) => {
                                 tracing::warn!("upstream client init failed: {e:#}");
@@ -474,7 +481,7 @@ pub fn run() {
             // user has a deliberate non-localhost value, no-ops when
             // already correct, only writes on a real change.
             if let Some(port) = http_port {
-                crate::setup::auto_install(port);
+                crate::setup::auto_install(port, &nonces);
             }
 
             // Tier-C: subscribe to the backend's per-API-key release
@@ -503,6 +510,7 @@ pub fn run() {
                 daemon: Arc::clone(&daemon),
                 ipc,
                 http_port,
+                nonces: Arc::clone(&nonces),
                 pairing_cancel: StdMutex::new(None),
             });
 
