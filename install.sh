@@ -87,20 +87,27 @@ file_path, dotted = sys.argv[1], sys.argv[2]
 with open(file_path) as fh:
     data = json.load(fh)
 keys = dotted.split(".")
-node = data
-for k in keys[:-1]:
-    if not isinstance(node, dict) or k not in node:
+# Walk to the parent of the leaf. We delete the whole leaf node (e.g.
+# the full `mcpServers.rivault` object) instead of just its `url`
+# subkey — otherwise an orphan `{ "type": "http" }` stays behind and
+# Claude tries to connect to a deleted server.
+parent = data
+for k in keys[:-2]:
+    if not isinstance(parent, dict) or k not in parent:
         sys.exit(1)
-    node = node[k]
-if not isinstance(node, dict):
+    parent = parent[k]
+if not isinstance(parent, dict):
     sys.exit(1)
-val = node.get(keys[-1], "")
-if isinstance(val, str) and ("127.0.0.1" in val or "://localhost" in val):
-    del node[keys[-1]]
-    with open(file_path, "w") as fh:
-        json.dump(data, fh, indent=2)
-    sys.exit(0)
-sys.exit(1)
+leaf_key = keys[-2]
+leaf = parent.get(leaf_key)
+if not isinstance(leaf, dict):
+    sys.exit(1)
+url = leaf.get(keys[-1], "")
+if not isinstance(url, str) or ("127.0.0.1" not in url and "://localhost" not in url):
+    sys.exit(1)
+del parent[leaf_key]
+with open(file_path, "w") as fh:
+    json.dump(data, fh, indent=2)
 PY
         done
         # Codex config is TOML — strip just our marker block.
@@ -127,6 +134,15 @@ PY
         openclaw plugins uninstall rivault --force >/dev/null 2>&1 \
             && green "  unregistered OpenClaw plugin" \
             || true
+    fi
+    # Belt-and-suspenders: openclaw plugins uninstall sometimes leaves
+    # the extension directory behind when its install record was already
+    # cleared by a prior call (it then refuses with "not managed by
+    # plugins config/install records and cannot be uninstalled"). Make
+    # sure no orphaned plugin dir survives.
+    if [ -d "${HOME}/.openclaw/extensions/rivault" ]; then
+        rm -rf "${HOME}/.openclaw/extensions/rivault" \
+            && green "  removed orphan ~/.openclaw/extensions/rivault"
     fi
     if [ "$PURGE" = "1" ]; then
         [ -d "$SKILL_DIR" ] && rm -rf "$SKILL_DIR" && green "  removed $SKILL_DIR"
