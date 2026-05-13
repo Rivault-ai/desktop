@@ -10,6 +10,29 @@ breaking changes to the daemon's release-event contract.
 
 ---
 
+## v0.3.3 — 2026-05-13
+
+Pair-your-Mac flow now uses a custom URL scheme so browser extensions
+can't block the handoff.
+
+**Daemon**
+- **`rivault://pair?nonce=…&apiKey=…` deep link** registered via
+  `tauri-plugin-deep-link`. The desktop-pair page sets
+  `window.location.href` to that URL after generating the key; macOS
+  routes the navigation to Rivault.app via Apple events, bypassing the
+  loopback fetch entirely. Closes the `ERR_BLOCKED_BY_CLIENT`
+  failure mode where uBlock Origin / Brave Shields / Privacy Badger
+  would silently kill the page's POST to `127.0.0.1:<port>` and leave
+  the user staring at "Failed to fetch".
+- **Two-path delivery, first-arrival wins.** The localhost listener
+  the previous flow used stays in place as a fallback — fine for
+  older builds and for browsers without a registered scheme handler.
+  `pairing::deliver_via_url` and the existing loopback handler share
+  the same `oneshot::Sender`; whichever arrives first completes the
+  pairing.
+
+---
+
 ## v0.3.2 — 2026-05-13
 
 Sign-in flow now configures the OpenClaw plugin too, so users who

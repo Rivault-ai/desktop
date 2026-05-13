@@ -53,6 +53,12 @@ pub struct AppState {
     /// Holds the cancel handle while a passkey pairing flow is active.
     /// `Some(_)` = pairing in progress; `None` = idle.
     pub pairing_cancel: StdMutex<Option<oneshot::Sender<()>>>,
+    /// Shared snapshot of the active pairing session (nonce + sender) so
+    /// the `rivault://pair?...` deep-link handler can complete the same
+    /// `oneshot::Sender<String>` the loopback handler would. Populated by
+    /// `pairing::start`; cleared on cancel / timeout / successful deliver.
+    pub pairing_state:
+        Arc<tokio::sync::Mutex<Option<crate::pairing::PairingState>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -224,7 +230,7 @@ async fn start_pairing(
         *guard = Some(cancel_tx);
     }
 
-    let handle = pairing::start(cancel_rx).await.map_err(|e| e.to_string());
+    let handle = pairing::start(cancel_rx, Arc::clone(&state.pairing_state)).await.map_err(|e| e.to_string());
     let result = match handle {
         Ok(h) => match h.wait().await {
             Ok(api_key) => match config::validate(&api_key, &base).await {
@@ -383,6 +389,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             // Second-instance attempt → foreground the running window.
             show_main_window(app);
@@ -557,6 +564,39 @@ pub fn run() {
                 tracing::warn!("discovery file write failed: {e:#}");
             }
 
+            let pairing_state: Arc<tokio::sync::Mutex<Option<crate::pairing::PairingState>>> =
+                Arc::new(tokio::sync::Mutex::new(None));
+            // Plug a deep-link listener that completes the active pairing
+            // session when the browser hands us `rivault://pair?nonce=...&apiKey=...`.
+            // This is the bypass for Chrome extensions that block the
+            // page's fetch to 127.0.0.1 with ERR_BLOCKED_BY_CLIENT.
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let pairing_state_for_dl = Arc::clone(&pairing_state);
+                let handle = app.handle().clone();
+                handle.deep_link().on_open_url(move |event| {
+                    let urls = event.urls();
+                    let pairing_state = Arc::clone(&pairing_state_for_dl);
+                    tauri::async_runtime::spawn(async move {
+                        for url in urls {
+                            match crate::pairing::deliver_via_url(&pairing_state, &url).await {
+                                Ok(true) => tracing::info!(
+                                    "pairing delivered via deep link {}",
+                                    url.as_str()
+                                ),
+                                Ok(false) => tracing::debug!(
+                                    "deep link ignored (no active pairing or bad nonce): {}",
+                                    url.as_str()
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "deep link delivery error for {}: {e:#}",
+                                    url.as_str()
+                                ),
+                            }
+                        }
+                    });
+                });
+            }
             app.manage(AppState {
                 daemon: Arc::clone(&daemon),
                 ipc,
@@ -564,6 +604,7 @@ pub fn run() {
                 nonces: Arc::clone(&nonces),
                 upstream_cell: Arc::clone(&upstream_cell),
                 pairing_cancel: StdMutex::new(None),
+                pairing_state: Arc::clone(&pairing_state),
             });
 
             // ----- menu bar tray --------------------------------------------
