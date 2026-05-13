@@ -47,10 +47,18 @@ use crate::upstream::{
 /// (`mcp::require_runtime_nonce`), which stashes the matched
 /// `AgentRuntime` in the request's extensions. Tool handlers read it
 /// back via `runtime_from_request` at the point of use.
+/// Shared cell holding the daemon's upstream HTTP client. `None` until
+/// the user pastes an API key in Setup; populated by `save_config` the
+/// moment that key validates against `/agent/me`. Mounted on the MCP
+/// router unconditionally so the `/mcp` route exists from the first
+/// daemon boot — tool handlers check this cell on each call and return a
+/// clear "not configured" error before the user is signed in.
+pub type UpstreamCell = Arc<std::sync::RwLock<Option<UpstreamClient>>>;
+
 #[derive(Clone)]
 pub struct RivaultMcp {
     daemon: Arc<Daemon>,
-    upstream: UpstreamClient,
+    upstream_cell: UpstreamCell,
     /// Populated and consumed by the `#[tool_router]` / `#[tool_handler]`
     /// macros via reflection — Rust's dead-code analysis can't see that.
     #[allow(dead_code)]
@@ -58,12 +66,28 @@ pub struct RivaultMcp {
 }
 
 impl RivaultMcp {
-    pub fn new(daemon: Arc<Daemon>, upstream: UpstreamClient) -> Self {
+    pub fn new(daemon: Arc<Daemon>, upstream_cell: UpstreamCell) -> Self {
         Self {
             daemon,
-            upstream,
+            upstream_cell,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Snapshot the current upstream client or return a clear
+    /// configuration-required error. Lock is held only across the
+    /// `.clone()`, never across an `.await`.
+    fn upstream(&self) -> Result<UpstreamClient, McpError> {
+        self.upstream_cell
+            .read()
+            .expect("upstream cell lock poisoned")
+            .clone()
+            .ok_or_else(|| {
+                McpError::invalid_request(
+                    "Rivault is not yet configured. Open the Rivault app and                      paste your rv_live_ API key in Settings — the tool will                      start working as soon as you save it (no restart needed).",
+                    None,
+                )
+            })
     }
 }
 
@@ -183,7 +207,7 @@ impl RivaultMcp {
         &self,
         Parameters(CheckArgs { query }): Parameters<CheckArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.upstream.search(&query).await {
+        match self.upstream()?.search(&query).await {
             Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&serde_json::json!({ "results": resp.results
                     .iter()
@@ -211,8 +235,7 @@ impl RivaultMcp {
         Parameters(GetSecretArgs { item_id }): Parameters<GetSecretArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let resp = self
-            .upstream
+        let resp = self.upstream()?
             .get_secret(&item_id)
             .await
             .map_err(|e| upstream_err("rivault_get_secret", e))?;
@@ -263,7 +286,7 @@ impl RivaultMcp {
         &self,
         Parameters(CheckLoginArgs { website }): Parameters<CheckLoginArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.upstream.check_login(&website).await {
+        match self.upstream()?.check_login(&website).await {
             Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&serde_json::json!({
                     "found": resp.found,
@@ -316,8 +339,7 @@ impl RivaultMcp {
             callback_session_id,
         }): Parameters<RequestAuthArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let resp = self
-            .upstream
+        let resp = self.upstream()?
             .create_auth_request(
                 &item_id,
                 reason.as_deref(),
@@ -354,8 +376,7 @@ impl RivaultMcp {
         Parameters(PollAuthArgs { auth_request_id }): Parameters<PollAuthArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let outcome = self
-            .upstream
+        let outcome = self.upstream()?
             .poll_auth_status(&auth_request_id)
             .await
             .map_err(|e| upstream_err("rivault_poll_auth", e))?;
@@ -417,8 +438,7 @@ impl RivaultMcp {
         let mut interval = Duration::from_secs(3);
         let session_id = mcp_session_id(&ctx);
         loop {
-            let outcome = self
-                .upstream
+            let outcome = self.upstream()?
                 .poll_auth_status(&auth_request_id)
                 .await
                 .map_err(|e| upstream_err("rivault_await_auth", e))?;
@@ -454,8 +474,7 @@ impl RivaultMcp {
             callback_session_id,
         }): Parameters<RequestFormArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let resp = self
-            .upstream
+        let resp = self.upstream()?
             .create_form_request(
                 &requested_label,
                 &requested_category,
@@ -481,8 +500,7 @@ impl RivaultMcp {
         &self,
         Parameters(PollFormArgs { form_request_id }): Parameters<PollFormArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let outcome = self
-            .upstream
+        let outcome = self.upstream()?
             .poll_form_status(&form_request_id)
             .await
             .map_err(|e| upstream_err("rivault_poll_form", e))?;
@@ -526,8 +544,7 @@ impl RivaultMcp {
                 label: f.label,
             })
             .collect();
-        let resp = self
-            .upstream
+        let resp = self.upstream()?
             .create_hybrid_request(
                 &auth_item_ids,
                 &fields,
@@ -563,8 +580,7 @@ impl RivaultMcp {
         Parameters(PollHybridArgs { hybrid_request_id }): Parameters<PollHybridArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let outcome = self
-            .upstream
+        let outcome = self.upstream()?
             .poll_hybrid_status(&hybrid_request_id)
             .await
             .map_err(|e| upstream_err("rivault_poll_hybrid", e))?;
@@ -631,8 +647,7 @@ impl RivaultMcp {
         let mut interval = Duration::from_secs(3);
         let session_id = mcp_session_id(&ctx);
         loop {
-            let outcome = self
-                .upstream
+            let outcome = self.upstream()?
                 .poll_hybrid_status(&hybrid_request_id)
                 .await
                 .map_err(|e| upstream_err("rivault_await_hybrid", e))?;
@@ -671,8 +686,7 @@ impl RivaultMcp {
             callback_session_id,
         }): Parameters<RequestLoginArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let resp = self
-            .upstream
+        let resp = self.upstream()?
             .create_login_request(
                 &website,
                 reason.as_deref(),
@@ -705,8 +719,7 @@ impl RivaultMcp {
         Parameters(PollLoginArgs { login_request_id }): Parameters<PollLoginArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let outcome = self
-            .upstream
+        let outcome = self.upstream()?
             .poll_login_status(&login_request_id)
             .await
             .map_err(|e| upstream_err("rivault_poll_login", e))?;
@@ -757,8 +770,7 @@ impl RivaultMcp {
         let mut interval = Duration::from_secs(3);
         let session_id = mcp_session_id(&ctx);
         loop {
-            let outcome = self
-                .upstream
+            let outcome = self.upstream()?
                 .poll_login_status(&login_request_id)
                 .await
                 .map_err(|e| upstream_err("rivault_await_login", e))?;
@@ -1074,3 +1086,64 @@ fn json_result(value: serde_json::Value) -> CallToolResult {
         serde_json::to_string(&value).unwrap_or_else(|_| "{}".into()),
     )])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::RwLock;
+
+    use crate::ledger::Ledger;
+
+    fn empty_cell() -> UpstreamCell {
+        Arc::new(RwLock::new(None))
+    }
+
+    fn ready_cell() -> UpstreamCell {
+        let client = UpstreamClient::new("https://api.rivault.ai", "rv_live_test").unwrap();
+        Arc::new(RwLock::new(Some(client)))
+    }
+
+    fn daemon() -> Arc<Daemon> {
+        Arc::new(Daemon::new(Ledger::open_in_memory().unwrap()))
+    }
+
+    #[test]
+    fn upstream_returns_clear_error_when_cell_empty() {
+        let mcp = RivaultMcp::new(daemon(), empty_cell());
+        let err = mcp.upstream().err().expect("expected not-configured error");
+        let dbg = format!("{err:?}");
+        assert!(
+            dbg.contains("not yet configured"),
+            "error must guide the user to Setup; got: {dbg}"
+        );
+    }
+
+    #[test]
+    fn upstream_hot_install_through_cell_is_visible_to_handler() {
+        // Mirrors what `save_config` does: write a fresh client into a
+        // previously-empty cell, then assert the helper sees it on the
+        // very next call (no restart, no remount).
+        let cell = empty_cell();
+        let mcp = RivaultMcp::new(daemon(), Arc::clone(&cell));
+        assert!(mcp.upstream().is_err(), "empty cell must error");
+
+        let client = UpstreamClient::new("https://api.rivault.ai", "rv_live_test").unwrap();
+        *cell.write().unwrap() = Some(client);
+
+        assert!(
+            mcp.upstream().is_ok(),
+            "after hot-install, the next call must succeed"
+        );
+    }
+
+    #[test]
+    fn upstream_helper_clones_so_handler_can_drop_lock_before_await() {
+        // Defensive — the helper must return an owned `UpstreamClient`
+        // so handlers don't hold the `RwLock` across `.await` points.
+        // This compiles only if the return type is `UpstreamClient`
+        // (not a borrow), so the test is mostly a type-system anchor.
+        let mcp = RivaultMcp::new(daemon(), ready_cell());
+        let _owned: UpstreamClient = mcp.upstream().unwrap();
+    }
+}
+
