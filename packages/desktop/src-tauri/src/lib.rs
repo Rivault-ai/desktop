@@ -390,9 +390,38 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // Second-instance attempt → foreground the running window.
             show_main_window(app);
+            // On macOS, when a `rivault://…` URL is opened while the app
+            // is already running, the OS launches a fresh process and
+            // hands the URL on argv. tauri-plugin-single-instance
+            // redirects that launch to the existing app — but the URL
+            // doesn't automatically replay through tauri-plugin-deep-link.
+            // We have to manually forward any rivault:// argv into the
+            // pairing flow.
+            use tauri::Manager;
+            for arg in &argv {
+                if !arg.starts_with("rivault://") {
+                    continue;
+                }
+                let Ok(parsed) = url::Url::parse(arg) else { continue };
+                let Some(state) = app.try_state::<AppState>() else { continue };
+                let pairing_state = Arc::clone(&state.pairing_state);
+                tauri::async_runtime::spawn(async move {
+                    match crate::pairing::deliver_via_url(&pairing_state, &parsed).await {
+                        Ok(true) => tracing::info!(
+                            "pairing delivered via single-instance argv URL"
+                        ),
+                        Ok(false) => tracing::debug!(
+                            "deep link via argv ignored (no active pairing or bad nonce)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            "deep link via argv delivery error: {e:#}"
+                        ),
+                    }
+                });
+            }
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
