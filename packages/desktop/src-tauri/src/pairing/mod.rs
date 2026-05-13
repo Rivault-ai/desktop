@@ -29,6 +29,7 @@ use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 
+pub mod openclaw_export;
 pub mod openclaw_import;
 
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(5 * 60);

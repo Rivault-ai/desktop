@@ -166,6 +166,18 @@ async fn save_config(
             "save_config wrote config.json but upstream client init failed: {e:#}"
         ),
     }
+    // Mirror the key into OpenClaw's plugin config so a returning
+    // OpenClaw user doesn't have to re-paste it in a separate place
+    // (or re-run install.sh interactively) to get the JS tools
+    // authenticated. Best-effort: OpenClaw not installed → Ok(false),
+    // not an error.
+    match crate::pairing::openclaw_export::write_credentials(&api_key, &base) {
+        Ok(true) => tracing::info!("openclaw plugin config updated with new key"),
+        Ok(false) => {} // openclaw not installed; nothing to mirror
+        Err(e) => tracing::warn!(
+            "save_config could not update openclaw.json (continuing): {e:#}"
+        ),
+    }
     enable_autostart_silent(&app);
     Ok(ConfigStatus {
         configured: true,
@@ -178,7 +190,15 @@ async fn save_config(
 
 #[tauri::command]
 async fn clear_config() -> Result<(), String> {
-    config::clear().map_err(|e| e.to_string())
+    config::clear().map_err(|e| e.to_string())?;
+    // Symmetric with save_config: when the user signs out we also
+    // clear our credentials from OpenClaw's plugin config so the JS
+    // tools fail fast on the next call instead of using a stale key.
+    // Best-effort; never fail sign-out on this.
+    if let Err(e) = crate::pairing::openclaw_export::clear_credentials() {
+        tracing::warn!("clear_config could not clean openclaw.json: {e:#}");
+    }
+    Ok(())
 }
 
 /// Begin a passkey-based pairing flow. Opens the user's browser to the
