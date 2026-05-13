@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Rivault",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "identifier": "ai.rivault.daemon",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -25,7 +25,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
+    "targets": [
+      "app"
+    ],
     "category": "DeveloperTool",
     "shortDescription": "Local secrets daemon for AI agents",
     "longDescription": "Rivault is a zero-knowledge encrypted secrets vault for AI agents. The desktop daemon watches agent transcripts on this machine and scrubs released vault values after every task.",
@@ -39,6 +41,15 @@
     ],
     "macOS": {
       "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "macOS": {
+        "schemes": [
+          "rivault"
+        ]
+      }
     }
   }
 }
