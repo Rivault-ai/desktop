@@ -260,6 +260,44 @@ if [ -n "${API_KEY:-}" ]; then
 EOF
     chmod 600 "$CONFIG_FILE"
     green "  wrote $CONFIG_FILE (mode 600)"
+
+    # OpenClaw plugin reads the key from `plugins.entries.rivault.config.apiKey`
+    # (OpenClaw injects it as `options.apiKey` when loading the plugin), with a
+    # fallback to the `RIVAULT_API_KEY` env var. Writing to the plugin config
+    # is the right path because (a) it doesn't touch the user's shell rc and
+    # (b) it survives across shells, sessions, and reboots.
+    OPENCLAW_CFG="${HOME}/.openclaw/openclaw.json"
+    if [ -f "$OPENCLAW_CFG" ] && command -v python3 >/dev/null 2>&1; then
+        if API_KEY="$API_KEY" BASE_URL="$BASE_URL" python3 - "$OPENCLAW_CFG" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+with open(path) as fh:
+    data = json.load(fh)
+plugins = data.setdefault("plugins", {})
+entries = plugins.setdefault("entries", {})
+rivault = entries.setdefault("rivault", {})
+rivault["enabled"] = True
+cfg = rivault.setdefault("config", {})
+cfg["apiKey"] = os.environ["API_KEY"]
+cfg["apiUrl"] = os.environ["BASE_URL"]
+allow = plugins.setdefault("allow", [])
+if "rivault" not in allow:
+    allow.append("rivault")
+with open(path, "w") as fh:
+    json.dump(data, fh, indent=2)
+PY
+        then
+            green "  wrote API key to OpenClaw plugin config"
+        else
+            warn "  could not write API key to $OPENCLAW_CFG — set it manually in OpenClaw"
+        fi
+    elif [ ! -f "$OPENCLAW_CFG" ]; then
+        # OpenClaw not installed yet — the key in $CONFIG_FILE is enough
+        # for the desktop daemon. When the user later installs OpenClaw,
+        # they'll need to re-run this installer (or set RIVAULT_API_KEY
+        # manually) to wire the key into the plugin config.
+        :
+    fi
 else
     warn "  skipped -- set the key later via the desktop app's Settings tab."
 fi
