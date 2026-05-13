@@ -2,7 +2,7 @@
 # Rivault installer for macOS.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Rivault-ai/desktop/main/install.sh | sh
+#   curl -fsSL https://www.rivault.ai/install.sh | sh
 #
 # Flags:
 #   --uninstall  Remove the app, skill, and config (preserves the local ledger).
