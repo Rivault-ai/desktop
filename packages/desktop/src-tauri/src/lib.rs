@@ -43,6 +43,13 @@ pub struct AppState {
     /// any inbound request without a valid nonce. See
     /// `mcp::runtime_nonce` for the derivation.
     pub nonces: Arc<crate::mcp::RuntimeNonceMap>,
+    /// Shared cell holding the daemon's upstream HTTP client. The MCP
+    /// router is mounted unconditionally at startup; `save_config`
+    /// writes a fresh client into this cell the moment the user's API
+    /// key validates against `/agent/me`. Tool calls read+clone on
+    /// each request, so a sign-in that lands mid-session is reflected
+    /// on the next tool call — no daemon restart needed.
+    pub upstream_cell: crate::mcp::UpstreamCell,
     /// Holds the cancel handle while a passkey pairing flow is active.
     /// `Some(_)` = pairing in progress; `None` = idle.
     pub pairing_cancel: StdMutex<Option<oneshot::Sender<()>>>,
@@ -128,6 +135,7 @@ fn mask_key(k: &str) -> String {
 #[tauri::command]
 async fn save_config(
     app: AppHandle,
+    state: tauri::State<'_, AppState>,
     api_key: String,
     base_url: Option<String>,
 ) -> Result<ConfigStatus, String> {
@@ -142,6 +150,22 @@ async fn save_config(
         api_key_id: me.api_key_id.clone(),
     };
     config::save(&cfg).map_err(|e| e.to_string())?;
+    // Wire the validated credentials into the upstream cell so the MCP
+    // router — already mounted on `/mcp` since daemon startup — starts
+    // serving tool calls immediately. No restart, no re-mount; the
+    // tool handlers read+clone from this cell on every call.
+    match crate::upstream::UpstreamClient::new(base.clone(), api_key.clone()) {
+        Ok(client) => {
+            *state
+                .upstream_cell
+                .write()
+                .expect("upstream cell lock poisoned") = Some(client);
+            tracing::info!("upstream client hot-installed after save_config");
+        }
+        Err(e) => tracing::warn!(
+            "save_config wrote config.json but upstream client init failed: {e:#}"
+        ),
+    }
     enable_autostart_silent(&app);
     Ok(ConfigStatus {
         configured: true,
@@ -408,70 +432,66 @@ pub fn run() {
                 }
             });
 
-            // If config is present, spin up the local MCP server so it
-            // mounts on the same listener as /release and /stop. This
-            // keeps the desktop daemon a single-process app — the agent
-            // talks to one address for everything.
+            // Mount the MCP and Tier-B proxy routers UNCONDITIONALLY so the
+            // `/mcp` route exists from the first daemon boot. The upstream
+            // HTTP client lives in a shared `Arc<RwLock<Option<...>>>` cell
+            // that starts empty when no config is loaded; the moment
+            // `save_config` validates the user's first API key it writes a
+            // fresh client into the cell and every subsequent MCP tool
+            // call begins to succeed — no daemon restart needed.
             //
-            // No config = no API key = no upstream calls possible, so
-            // we skip the MCP mount; once the user signs in, the next
-            // app launch will bring it up. Live re-mount-without-restart
-            // is a future improvement (gate at tool-call time on a
-            // current-config snapshot).
-            let (mcp_router, proxy_router): (Option<axum::Router>, Option<axum::Router>) =
-                match config::load() {
-                    Ok(Some(cfg)) => {
-                        let mcp = match crate::upstream::UpstreamClient::new(
-                            cfg.base_url.clone(),
-                            cfg.api_key.clone(),
-                        ) {
-                            Ok(client) => Some(crate::mcp::router(
-                                Arc::clone(&daemon),
-                                client,
-                                // Per-runtime nonce authentication: every
-                                // inbound request is matched against this
-                                // table by middleware, which stashes the
-                                // resolved AgentRuntime in the request
-                                // extensions before the handler runs.
-                                Arc::clone(&nonces),
-                            )),
-                            Err(e) => {
-                                tracing::warn!("upstream client init failed: {e:#}");
-                                None
-                            }
-                        };
-                        // Tier-B proxy lives alongside /mcp; it forwards
-                        // /agent/* with the agent's own Bearer header so
-                        // it doesn't depend on the daemon's configured
-                        // key matching the agent's.
-                        let proxy = match crate::proxy::ProxyState::with_backend(
-                            Arc::clone(&daemon),
-                            crate::daemon::release::AgentRuntime::Openclaw,
-                            &cfg.base_url,
-                        ) {
-                            Ok(state) => Some(crate::proxy::router(state)),
-                            Err(e) => {
-                                tracing::warn!("proxy init failed: {e:#}");
-                                None
-                            }
-                        };
-                        (mcp, proxy)
-                    }
+            // Tool handlers read+clone from the cell on every call (cheap
+            // — UpstreamClient is `Clone` over `Arc<str>` + `reqwest::Client`)
+            // and return a clear "Rivault is not yet configured" McpError
+            // when the cell is still empty.
+            let upstream_cell: crate::mcp::UpstreamCell = Arc::new(
+                std::sync::RwLock::new(match config::load() {
+                    Ok(Some(cfg)) => crate::upstream::UpstreamClient::new(
+                        cfg.base_url.clone(),
+                        cfg.api_key.clone(),
+                    )
+                    .map_err(|e| {
+                        tracing::warn!("startup upstream init failed: {e:#}; deferring to save_config");
+                        e
+                    })
+                    .ok(),
                     Ok(None) => {
-                        tracing::info!("no config — skipping MCP/proxy mount until sign-in");
-                        (None, None)
+                        tracing::info!("no config yet — MCP router mounted empty; save_config will hot-install the upstream client");
+                        None
                     }
                     Err(e) => {
                         tracing::warn!("config load failed: {e:#}");
-                        (None, None)
+                        None
                     }
-                };
+                }),
+            );
+
+            let mcp_router = crate::mcp::router(
+                Arc::clone(&daemon),
+                Arc::clone(&upstream_cell),
+                Arc::clone(&nonces),
+            );
+
+            // Tier-B proxy lives alongside /mcp; it forwards /agent/*
+            // with the agent's own Bearer header so it doesn't depend
+            // on the daemon's configured key matching the agent's.
+            // Always uses the default backend at mount time — a custom
+            // base_url is a rare edge case and won't break here.
+            let proxy_router = match crate::proxy::ProxyState::new(
+                Arc::clone(&daemon),
+                crate::daemon::release::AgentRuntime::Openclaw,
+            ) {
+                Ok(state) => Some(crate::proxy::router(state)),
+                Err(e) => {
+                    tracing::warn!("proxy init failed: {e:#}");
+                    None
+                }
+            };
+
             // Merge MCP + proxy into one router for the localhost listener.
-            let extra_router: Option<axum::Router> = match (mcp_router, proxy_router) {
-                (Some(m), Some(p)) => Some(m.merge(p)),
-                (Some(m), None) => Some(m),
-                (None, Some(p)) => Some(p),
-                (None, None) => None,
+            let extra_router: Option<axum::Router> = match proxy_router {
+                Some(p) => Some(mcp_router.merge(p)),
+                None => Some(mcp_router),
             };
 
             // Localhost HTTP — bind synchronously to capture the port, then
@@ -522,6 +542,7 @@ pub fn run() {
                 ipc,
                 http_port,
                 nonces: Arc::clone(&nonces),
+                upstream_cell: Arc::clone(&upstream_cell),
                 pairing_cancel: StdMutex::new(None),
             });
 

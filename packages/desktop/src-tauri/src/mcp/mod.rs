@@ -24,10 +24,9 @@ use rmcp::transport::streamable_http_server::{
 };
 
 pub use runtime_nonce::RuntimeNonceMap;
-pub use server::RivaultMcp;
+pub use server::{RivaultMcp, UpstreamCell};
 
 use crate::daemon::Daemon;
-use crate::upstream::UpstreamClient;
 
 /// Build an axum router that serves Rivault's MCP tool surface at `/mcp`.
 ///
@@ -45,7 +44,7 @@ use crate::upstream::UpstreamClient;
 /// existing localhost HTTP app — see `ipc::localhost_http::serve`.
 pub fn router(
     daemon: Arc<Daemon>,
-    upstream: UpstreamClient,
+    upstream: UpstreamCell,
     nonces: Arc<RuntimeNonceMap>,
 ) -> Router {
     let service = StreamableHttpService::new(

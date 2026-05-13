@@ -10,6 +10,34 @@ breaking changes to the daemon's release-event contract.
 
 ---
 
+## v0.3.1 — 2026-05-13
+
+First-run UX fix: the MCP server now hot-mounts the moment `save_config`
+validates the user's API key, instead of requiring a daemon restart.
+
+**Daemon**
+- **`mcp::UpstreamCell` (`Arc<RwLock<Option<UpstreamClient>>>`).** The
+  MCP router is mounted on `/mcp` unconditionally at daemon startup.
+  Tool handlers read+clone the upstream client from this cell on every
+  call; an empty cell returns a clear "Rivault is not yet configured.
+  Open the Rivault app and paste your `rv_live_` API key in Settings"
+  McpError instead of a 404.
+- **`save_config` hot-installs the upstream client** into the cell
+  immediately after `/agent/me` validation. The next MCP tool call
+  succeeds — no restart, no re-mount.
+- **Tier-B proxy mounts unconditionally too**, defaulting to
+  `https://api.rivault.ai`. Pass-through auth means the agent's own
+  Authorization header is what matters, so the proxy works for any
+  agent that has its own API key, with or without a configured daemon.
+
+**Tests**
+- Three new unit tests in `mcp/server.rs::tests`: empty cell errors
+  with a Setup-pointing message; a hot-installed client is visible
+  to the next call without restart; the helper's return type is
+  owned so handlers can drop the lock before awaiting.
+
+---
+
 ## v0.3.0 — 2026-05-12
 
 End-to-end deterministic redaction across all current agent runtimes, plus
