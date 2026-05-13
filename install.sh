@@ -204,6 +204,14 @@ ditto "$TMPDIR_/extract/Rivault.app" "$APP_DIR"
 # "developer cannot be verified" sheet on first launch.
 xattr -dr com.apple.quarantine "$APP_DIR" 2>/dev/null || true
 
+# Force-register the just-installed bundle with Launch Services so future
+# `open -a Rivault` calls resolve to /Applications/Rivault.app, not to any
+# stale dev-build copy LS may have indexed. Without this step, a developer
+# who once built locally and then ran install.sh would get the OLD bundle
+# launched every time, and the new code would never run.
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+[ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DIR" >/dev/null 2>&1 || true
+
 echo "  Installing skill -> $SKILL_DIR"
 mkdir -p "$(dirname "$SKILL_DIR")"
 [ -d "$SKILL_DIR" ] && rm -rf "$SKILL_DIR"
@@ -304,10 +312,10 @@ fi
 
 echo
 bold "Installed. Launching Rivault..."
-open -a Rivault || warn "Could not auto-launch. Run: open -a Rivault"
+open "$APP_DIR" || warn "Could not auto-launch. Run: open \"$APP_DIR\""
 echo
 echo "Tools:"
-echo "  open -a Rivault          # launch the daemon dashboard"
+echo "  open $APP_DIR         # launch the daemon dashboard"
 echo "  $0 --uninstall           # remove app + skill + config"
 echo
 green "Welcome to Rivault."
