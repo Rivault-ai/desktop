@@ -120,6 +120,14 @@ PY
     #   - The ledger at $SUPPORT_DIR holds release audit history the user
     #     may want to keep across reinstalls.
     # Pass --purge to nuke both.
+    # Unregister the OpenClaw plugin first so `openclaw plugins list`
+    # doesn't keep showing a stale entry pointing at a path we may be
+    # about to delete. Best-effort: openclaw not installed is fine.
+    if command -v openclaw >/dev/null 2>&1; then
+        openclaw plugins uninstall rivault --force >/dev/null 2>&1 \
+            && green "  unregistered OpenClaw plugin" \
+            || true
+    fi
     if [ "$PURGE" = "1" ]; then
         [ -d "$SKILL_DIR" ] && rm -rf "$SKILL_DIR" && green "  removed $SKILL_DIR"
         [ -d "$SUPPORT_DIR" ] && rm -rf "$SUPPORT_DIR" && green "  removed $SUPPORT_DIR"
@@ -184,6 +192,33 @@ echo "  Installing skill -> $SKILL_DIR"
 mkdir -p "$(dirname "$SKILL_DIR")"
 [ -d "$SKILL_DIR" ] && rm -rf "$SKILL_DIR"
 ditto "$TMPDIR_/extract/skill" "$SKILL_DIR"
+
+# Register the bundle as an OpenClaw plugin so the JS tools
+# (rivault_check, rivault_get_secret, rivault_request_auth, …) load into
+# the OpenClaw runtime. Without this step, OpenClaw scans only
+# ~/.openclaw/extensions/ for plugins (see openclaw's
+# `resolvePluginSourceRoots`) and falls back to bash+curl Mode B — which
+# bypasses the daemon's transcript redaction.
+#
+# `openclaw plugins install <dir>` copies into ~/.openclaw/extensions/
+# AND registers the plugin in ~/.openclaw/openclaw.json (entries +
+# installs + allow). Idempotent: re-running just refreshes the install.
+if command -v openclaw >/dev/null 2>&1; then
+    echo "  Registering OpenClaw plugin..."
+    # Idempotency: `openclaw plugins install` refuses to overwrite an
+    # existing ~/.openclaw/extensions/<id> dir, so uninstall first so
+    # re-running install.sh always lands a fresh, current bundle.
+    openclaw plugins uninstall rivault --force >/dev/null 2>&1 || true
+    if openclaw plugins install "$SKILL_DIR" >/dev/null 2>&1; then
+        green "  registered as OpenClaw plugin"
+    else
+        warn "  openclaw plugins install failed (continuing with bash fallback)"
+        warn "  to retry manually: openclaw plugins install $SKILL_DIR"
+    fi
+else
+    warn "  openclaw not in PATH — Rivault tools won't load until you install OpenClaw"
+    warn "  after installing OpenClaw, run: openclaw plugins install $SKILL_DIR"
+fi
 
 mkdir -p "$SUPPORT_DIR"
 

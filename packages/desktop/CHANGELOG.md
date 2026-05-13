@@ -36,6 +36,18 @@ validates the user's API key, instead of requiring a daemon restart.
   to the next call without restart; the helper's return type is
   owned so handlers can drop the lock before awaiting.
 
+**Installer**
+- **`install.sh` now registers the OpenClaw plugin.** Previously the
+  installer only dropped the bundle at `~/.openclaw/skills/rivault/`,
+  which OpenClaw's skill scanner reads (for `SKILL.md`) but the plugin
+  loader does not. New users would see the SKILL.md prompt but the JS
+  tools (`rivault_check`, …) never registered — agent fell back to
+  bash+curl, bypassing the daemon's MCP-mediated redaction. The
+  installer now also runs `openclaw plugins install <bundle>` so the
+  plugin lands at `~/.openclaw/extensions/rivault/` and is wired into
+  `openclaw.json`. Uninstall is symmetric: `install.sh --uninstall`
+  runs `openclaw plugins uninstall rivault --force` first.
+
 ---
 
 ## v0.3.0 — 2026-05-12
