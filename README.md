@@ -14,7 +14,7 @@ The Rivault API server, web app, and billing infrastructure live in a separate p
 
 ```bash
 # One-step curl install
-curl -fsSL https://raw.githubusercontent.com/Rivault-ai/desktop/main/install.sh | sh
+curl -fsSL https://www.rivault.ai/install.sh | sh
 
 # Or via Homebrew
 brew tap rivault-ai/tap
