@@ -10,6 +10,37 @@ breaking changes to the daemon's release-event contract.
 
 ---
 
+## v0.3.2 — 2026-05-13
+
+Sign-in flow now configures the OpenClaw plugin too, so users who
+pair via the desktop app don't have to re-run `install.sh` (or hand-
+edit `openclaw.json`) just to get the JS tools authenticated.
+
+**Daemon**
+- **`save_config` now mirrors the API key into OpenClaw's plugin
+  config.** After validating against `/agent/me` and writing
+  `~/Library/Application Support/Rivault/config.json`, the Tauri
+  command also writes the key into `~/.openclaw/openclaw.json::
+  plugins.entries.rivault.config.{apiKey, apiUrl}`, sets the entry
+  to `enabled: true`, and adds `"rivault"` to `plugins.allow` if
+  absent. Best-effort: OpenClaw not installed → no-op, never fails
+  sign-in. New module `pairing::openclaw_export` mirrors the
+  existing `openclaw_import` read path.
+- **`clear_config` (sign out) now strips our credentials from
+  OpenClaw's plugin config.** Symmetric with `save_config` so the
+  next OpenClaw tool call fails fast on a missing key rather than
+  using a stale one. `enabled` is left intact — clearing the key
+  shouldn't disable the plugin entry the user may want to keep.
+
+**Tests**
+- Six unit tests on the new module: missing openclaw.json returns
+  Ok(false); fresh write populates all fields and adds to `allow`;
+  pre-existing plugins + skills survive; overwrite path replaces
+  stale key; clear removes both fields in place; clear on
+  already-empty config is a no-op.
+
+---
+
 ## v0.3.1 — 2026-05-13
 
 First-run UX fix: the MCP server now hot-mounts the moment `save_config`
