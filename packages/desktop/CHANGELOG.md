@@ -10,7 +10,7 @@ breaking changes to the daemon's release-event contract.
 
 ---
 
-## v0.3.0 — 2026-05-11
+## v0.3.0 — 2026-05-12
 
 End-to-end deterministic redaction across all current agent runtimes, plus
 operational resilience (keypair persistence, public-endpoint passthrough)
@@ -90,6 +90,72 @@ running.
 - **Version footer** at the bottom of the app: `v0.3.0 · <git sha> ·
   built <timestamp>`. Click to copy the full build identifier to the
   clipboard for bug reports.
+- **Scanner failure banner.** When a cross-runtime transcript scrub
+  fails on the same path three times in a row (permission denied,
+  filesystem corruption, etc.), the desktop window surfaces a
+  destructive-variant banner with the path, error, and consecutive
+  count. Dismissible; auto-clears 30s after the most recent event.
+
+**Security audit (closes the v0.2.x audit findings)**
+- **P-256 point validation on the auth endpoint.** Backend now rejects
+  ephemeral pubkeys that aren't on the P-256 curve, closing an
+  invalid-curve attack that could have recovered mobile's ECDH private
+  key over repeated requests.
+- **Per-runtime MCP nonce.** Every managed MCP URL carries a nonce
+  derived from the per-install keychain secret; the daemon rejects any
+  `/mcp` request without a valid nonce. Closes the trivial spoofing of
+  `?runtime=…` by a same-UID local process. Migration is automatic —
+  the daemon rewrites every existing managed config on first launch.
+- **Discovery file integrity.** The skill refuses any `daemon.json`
+  that isn't a regular file at mode `0600` owned by the current UID;
+  the daemon explicitly re-tightens the mode on every write.
+- **`OsRng` for the keypair-store IV.** Replaced
+  `rand::thread_rng()`-derived IVs with `OsRng` to eliminate the
+  theoretical thread-reuse collision risk on AES-GCM wrap.
+- **Encrypted-at-rest recent-releases cache.** New SQLite store under
+  the daemon's data dir, wrapped with the same keychain secret used
+  for the keypair store. 1h TTL. Cross-runtime scrubbing now survives
+  a daemon restart.
+- **Trailer / TE header stripping** in the Tier-B proxy so rewritten
+  response bodies don't leave a strict client waiting for trailers
+  that never arrive.
+- **Sessions.json symlink defense** in the OpenClaw skill: the
+  resolved path must stay under `~/.openclaw/` and be owned by the
+  current UID; the previous behaviour followed symlinks blindly.
+- **Timing-safe API key compare.** Backend always runs `argon2.verify`
+  against a sentinel hash on the no-match path so the wall-clock
+  difference between "no row" and "row + verify" can't be used to
+  enumerate valid 16-char prefixes.
+- **Browser one-time token rotation.** The localhost-HTTP
+  `X-Rivault-Token` is now genuinely one-time-use: comparison is
+  constant-time, and a successful release atomically swaps in a fresh
+  token. Captured (header, body) pairs become inert on the next
+  request.
+- **`#[serde(deny_unknown_fields)]`** on every daemon-defined IPC
+  wire struct (`ReleaseEvent`, `StopBody`, the unix-socket /
+  websocket `Envelope` wrappers) so an attacker exploring the
+  HMAC-authenticated surface gets a loud reject instead of silent
+  field drops.
+- **`O_NOFOLLOW` on every scrubber file open** — closes a same-UID
+  TOCTOU window between `allowlist::validate_path` and the actual
+  open where an attacker could swap a leaf for a symlink pointing
+  outside the allowlist.
+- **HMAC replay protection.** `/release` and `/stop` reject any
+  signed payload whose `released_at` lies outside a ±60s window of
+  wall-clock time.
+- **EOF-stable scanner debounce.** The cross-runtime scanner waits
+  for `(size, mtime)` to be unchanged for 200 ms before scrubbing so
+  a multi-line tool result mid-write can't bait the scanner into
+  scanning a partial file.
+- **`jq` port parser in `SKILL.md`'s Mode B preamble** (was `awk`).
+  Range-validates the result to `[1, 65535]`.
+- **Skill poller log redaction.** Diagnostic log now keeps only the
+  `rv_live_` brand prefix; previously leaked 8 bits of the random
+  suffix.
+- **Audit-anchor regression test on `ledger::insert`.** The
+  orchestrator's no-panic discipline (`?` + `if let Err`) is pinned
+  by a unit test so a future refactor can't silently re-introduce
+  `.unwrap()`.
 
 ---
 
