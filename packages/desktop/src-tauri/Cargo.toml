@@ -1,6 +1,6 @@
 [package]
 name = "rivault-desktop"
-version = "0.3.5"
+version = "0.3.6"
 description = "Rivault Desktop daemon — deterministic local plaintext redaction"
 authors = ["Rivault"]
 edition = "2021"

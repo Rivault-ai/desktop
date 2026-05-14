@@ -281,9 +281,20 @@ EOF
     # fallback to the `RIVAULT_API_KEY` env var. Writing to the plugin config
     # is the right path because (a) it doesn't touch the user's shell rc and
     # (b) it survives across shells, sessions, and reboots.
+    #
+    # We deliberately do NOT write `apiUrl` to the plugin config. When set,
+    # OpenClaw uses it literally and the plugin bypasses the local daemon's
+    # URL discovery (~/Library/Application Support/Rivault/daemon.json),
+    # which routes calls direct-to-cloud and breaks L2 envelope decryption
+    # (the daemon owns the ephemeral keypair store; the cloud API returns
+    # an encrypted envelope keyed against a public key the daemon attached
+    # — without the daemon in the path, there's no keypair to decrypt
+    # against and pollAuth fails with "no keypair stored"). Leaving apiUrl
+    # unset lets the plugin auto-route through the daemon. Power users
+    # who need a non-default URL can still set RIVAULT_API_URL.
     OPENCLAW_CFG="${HOME}/.openclaw/openclaw.json"
     if [ -f "$OPENCLAW_CFG" ] && command -v python3 >/dev/null 2>&1; then
-        if API_KEY="$API_KEY" BASE_URL="$BASE_URL" python3 - "$OPENCLAW_CFG" <<'PY'
+        if API_KEY="$API_KEY" python3 - "$OPENCLAW_CFG" <<'PY'
 import json, os, sys
 path = sys.argv[1]
 with open(path) as fh:
@@ -294,7 +305,10 @@ rivault = entries.setdefault("rivault", {})
 rivault["enabled"] = True
 cfg = rivault.setdefault("config", {})
 cfg["apiKey"] = os.environ["API_KEY"]
-cfg["apiUrl"] = os.environ["BASE_URL"]
+# Scrub any pre-existing apiUrl left behind by earlier installers — see
+# the comment block above. Without this, an upgrade from v0.3.5 or
+# earlier silently keeps the user routed direct-to-cloud.
+cfg.pop("apiUrl", None)
 allow = plugins.setdefault("allow", [])
 if "rivault" not in allow:
     allow.append("rivault")

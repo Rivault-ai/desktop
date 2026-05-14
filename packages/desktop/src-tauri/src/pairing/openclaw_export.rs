@@ -24,10 +24,15 @@
 //!         - the Tauri app's `Contents/Resources/skill/` (the fallback
 //!           for users who installed via Homebrew Cask without running
 //!           install.sh)
-//!   3. Write `plugins.entries.rivault.config.{apiKey, apiUrl}` into
-//!      `openclaw.json`, set `enabled: true`, ensure `rivault` is in
-//!      `plugins.allow`. The CLI's `install` command does NOT populate
-//!      apiKey, so this step is still needed after a successful install.
+//!   3. Write `plugins.entries.rivault.config.apiKey` into `openclaw.json`,
+//!      set `enabled: true`, ensure `rivault` is in `plugins.allow`. The
+//!      CLI's `install` command does NOT populate apiKey, so this step
+//!      is still needed after a successful install. We deliberately do
+//!      NOT write `apiUrl`: when present, the plugin uses it literally
+//!      and bypasses the local daemon, which breaks L2 envelope
+//!      decryption (the daemon owns the ephemeral keypair store).
+//!      Leaving `apiUrl` unset lets the plugin auto-discover the daemon
+//!      via `~/Library/Application Support/Rivault/daemon.json`.
 //!
 //! Returns `Ok(true)` when the plugin was fully configured. `Ok(false)`
 //! when OpenClaw isn't installed (no warning, no work — this is the
@@ -97,7 +102,6 @@ pub fn has_openclaw() -> bool {
 /// work, this is the happy path for MCP-only users.
 pub fn install_and_configure(
     api_key: &str,
-    base_url: &str,
     bundled_skill_dir: Option<&Path>,
 ) -> Result<bool> {
     if !has_openclaw() {
@@ -116,7 +120,7 @@ pub fn install_and_configure(
         // Still write the apiKey to openclaw.json so the plugin
         // configuration is correct for whenever the skill bundle later
         // appears.
-        write_credentials_only(api_key, base_url)?;
+        write_credentials_only(api_key)?;
         tracing::warn!(
             "openclaw is installed but no skill bundle was found at \
              ~/.openclaw/skills/rivault or the app's Resources — wrote \
@@ -160,15 +164,24 @@ pub fn install_and_configure(
         );
     }
 
-    // The CLI registers the plugin but never sets apiKey/apiUrl on the
-    // plugin config — that's the daemon's job. Do it now.
-    write_credentials_only(api_key, base_url)?;
+    // The CLI registers the plugin but never sets apiKey on the plugin
+    // config — that's the daemon's job. Do it now.
+    write_credentials_only(api_key)?;
     Ok(true)
 }
 
-/// Write apiKey + apiUrl to `plugins.entries.rivault.config`. Used by
-/// `install_and_configure` and by `clear_credentials` for symmetry.
-fn write_credentials_only(api_key: &str, base_url: &str) -> Result<()> {
+/// Write `apiKey` to `plugins.entries.rivault.config`. We deliberately
+/// do NOT write `apiUrl`: when present, the plugin uses it literally,
+/// short-circuiting `config.apiBaseUrl`'s discovery logic and routing
+/// every call straight to the public API. That bypasses the local
+/// daemon, which is where ephemeral P-256 keypairs are generated and
+/// stored for L2 envelope decryption — without those, the daemon emits
+/// `no keypair stored for request_id=...; daemon restart between create
+/// and poll?` when the plugin tries to poll. Leaving `apiUrl` unset
+/// lets the plugin auto-discover the daemon via
+/// `~/Library/Application Support/Rivault/daemon.json`. Users who need
+/// to override the URL can still do so via `RIVAULT_API_URL`.
+fn write_credentials_only(api_key: &str) -> Result<()> {
     let path = openclaw_config_path().context("no home dir")?;
     let raw = fs::read_to_string(&path)?;
     let mut root: Value = serde_json::from_str(&raw)?;
@@ -194,7 +207,9 @@ fn write_credentials_only(api_key: &str, base_url: &str) -> Result<()> {
         anyhow::anyhow!("openclaw.json::plugins.entries.rivault.config is not an object")
     })?;
     config_obj.insert("apiKey".into(), Value::String(api_key.to_string()));
-    config_obj.insert("apiUrl".into(), Value::String(base_url.to_string()));
+    // Belt-and-suspenders: scrub any pre-existing apiUrl. Older builds
+    // wrote it and users upgrading should not stay routed direct-to-cloud.
+    config_obj.remove("apiUrl");
 
     let pretty = serde_json::to_string_pretty(&root)?;
     let tmp = path.with_extension("tmp.rivault");
@@ -270,19 +285,24 @@ mod tests {
     fn install_returns_false_without_openclaw() {
         let dir = tempfile::tempdir().unwrap();
         with_home(dir.path(), || {
-            let r = install_and_configure("rv_live_x", "https://api.rivault.ai", None).unwrap();
+            let r = install_and_configure("rv_live_x", None).unwrap();
             assert!(!r, "no openclaw → false, no work");
         });
     }
 
     #[test]
-    fn write_credentials_only_populates_fields() {
+    fn write_credentials_only_populates_apikey_and_scrubs_apiurl() {
         let dir = tempfile::tempdir().unwrap();
         with_home(dir.path(), || {
             let oc = dir.path().join(".openclaw");
             fs::create_dir_all(&oc).unwrap();
-            fs::write(oc.join("openclaw.json"), "{}").unwrap();
-            write_credentials_only("rv_live_test", "https://api.rivault.ai").unwrap();
+            // Seed with a pre-existing apiUrl from an older daemon
+            // version so we can verify the scrub.
+            fs::write(
+                oc.join("openclaw.json"),
+                r#"{ "plugins": { "entries": { "rivault": { "config": { "apiUrl": "https://api.rivault.ai" } } } } }"#,
+            ).unwrap();
+            write_credentials_only("rv_live_test").unwrap();
             let v: Value =
                 serde_json::from_str(&fs::read_to_string(oc.join("openclaw.json")).unwrap())
                     .unwrap();
@@ -291,9 +311,11 @@ mod tests {
                 v["plugins"]["entries"]["rivault"]["config"]["apiKey"],
                 "rv_live_test"
             );
-            assert_eq!(
-                v["plugins"]["entries"]["rivault"]["config"]["apiUrl"],
-                "https://api.rivault.ai"
+            assert!(
+                v["plugins"]["entries"]["rivault"]["config"]
+                    .get("apiUrl")
+                    .is_none(),
+                "stale apiUrl must be scrubbed so plugin auto-discovers daemon"
             );
         });
     }

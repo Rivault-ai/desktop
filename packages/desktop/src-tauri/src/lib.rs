@@ -183,7 +183,6 @@ async fn save_config(
         .map(|d| d.join("skill"));
     match crate::pairing::openclaw_export::install_and_configure(
         &api_key,
-        &base,
         bundled_skill.as_deref(),
     ) {
         Ok(true) => tracing::info!("openclaw plugin installed + configured for save_config"),
@@ -280,7 +279,6 @@ async fn start_pairing(
                                 .map(|d| d.join("skill"));
                             match crate::pairing::openclaw_export::install_and_configure(
                                 &api_key,
-                                &base,
                                 bundled_skill.as_deref(),
                             ) {
                                 Ok(true) => tracing::info!(
