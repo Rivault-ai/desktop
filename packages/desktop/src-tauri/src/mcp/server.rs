@@ -194,14 +194,19 @@ impl RivaultMcp {
                        etc.) — call once per field you need. \
                        \
                        MANDATORY: call this BEFORE asking the user for any \
-                       personal data. Only ask the user if rivault_check returns \
-                       no match. The user has Rivault installed specifically so \
-                       they don't have to retype this data — do not skip this \
-                       step. \
+                       personal data. The user has Rivault installed specifically \
+                       so they don't have to retype this data. \
                        \
-                       Returns matching item ids and their sensitivity tier (L1 \
-                       retrievable directly via rivault_get_secret, L2 requires \
-                       rivault_request_auth/hybrid)."
+                       On MATCH: use rivault_get_secret (L1) or \
+                       rivault_request_auth / rivault_request_hybrid (L2). \
+                       \
+                       On NO MATCH: do NOT ask the user to type the value in \
+                       chat. Use rivault_request_form (one missing field) or \
+                       rivault_request_hybrid (multiple missing fields, or a \
+                       mix with L2 items) to generate a secure form URL — the \
+                       user fills it in via the web and optionally saves it to \
+                       their vault. Asking in chat skips the save-to-vault UX \
+                       and leaves the value in the transcript unredacted."
     )]
     async fn rivault_check(
         &self,
@@ -810,26 +815,37 @@ impl ServerHandler for RivaultMcp {
              MANDATORY ORCHESTRATION (do not skip):\n\
              1. BEFORE asking the user for ANY personal data (email, phone, \
                 address, name, password, payment info, etc.), call \
-                `rivault_check` ONCE per field name. Only ask the user if \
-                rivault_check returns no match. Skipping this step is the #1 \
-                misuse — the user has Rivault installed specifically so they \
-                don't have to retype this data; do not ignore it.\n\
-             2. L1 items (sensitivityLevel=1): retrieve via `rivault_get_secret`.\n\
-             3. L2 items (sensitivityLevel=2): if you need only ONE item, use \
+                `rivault_check` ONCE per field name. Never just ask the user \
+                in chat without checking first — the user has Rivault installed \
+                specifically so they don't have to retype this data. That is \
+                the #1 misuse.\n\
+             2. When `rivault_check` returns NO match for a field, do NOT ask \
+                the user to type it in chat. Use `rivault_request_form` (single \
+                missing field) or `rivault_request_hybrid` (multiple missing \
+                fields, OR a mix of missing fields + L2 items) to generate a \
+                secure form URL — the user fills it in via the web and \
+                optionally saves the value to their vault for future tasks. \
+                Send the URL + the `agentMessage` from the response to the user \
+                verbatim. Asking in chat skips the save-to-vault UX (forcing \
+                them to retype on every future task) and bypasses transcript \
+                redaction (chat-typed values stay in the transcript forever). \
+                That is the #2 misuse.\n\
+             3. L1 items (sensitivityLevel=1): retrieve via `rivault_get_secret`.\n\
+             4. L2 items (sensitivityLevel=2): if you need only ONE item, use \
                 `rivault_request_auth` + `rivault_await_auth`. If you need \
                 MULTIPLE L2 items, OR a mix of L2 items + missing fields, use \
                 `rivault_request_hybrid` + `rivault_await_hybrid` — that's ONE \
                 approval link instead of N. Calling `rivault_request_auth` in \
                 a loop is misuse.\n\
-             4. After EVERY `rivault_request_auth` / `rivault_request_hybrid` \
-                / `rivault_request_login` call, you MUST immediately call the \
-                matching `rivault_await_*` tool. Do not stop and wait for the \
-                user to tell you they approved; do not poll manually; do not \
-                return control. The `await` tool blocks internally for up to \
-                3 minutes with 3-8s backoff and returns the plaintext when the \
-                user approves (or `denied`/`expired`). Forgetting this step is \
-                the #2 misuse.\n\
-             5. Use `rivault_poll_*` (one-shot) ONLY if you have a runtime \
+             5. After EVERY `rivault_request_auth` / `rivault_request_form` / \
+                `rivault_request_hybrid` / `rivault_request_login` call, you \
+                MUST immediately call the matching `rivault_await_*` tool. \
+                Do not stop and wait for the user to tell you they approved; \
+                do not poll manually; do not return control. The `await` tool \
+                blocks internally for up to 3 minutes with 3-8s backoff and \
+                returns the plaintext when the user approves (or \
+                `denied`/`expired`).\n\
+             6. Use `rivault_poll_*` (one-shot) ONLY if you have a runtime \
                 that polls in the background for you. If unsure, use `await`."
                 .into(),
         );

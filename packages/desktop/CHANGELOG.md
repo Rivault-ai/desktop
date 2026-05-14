@@ -10,6 +10,30 @@ breaking changes to the daemon's release-event contract.
 
 ---
 
+## v0.3.7 — 2026-05-14
+
+Claude was asking users to type missing personal data into chat
+instead of using `rivault_request_form` — the MCP server's
+orchestration block told it to "only ask the user if rivault_check
+returns no match" without saying what "ask" should look like, so
+the model defaulted to plain chat questions. That defeats two of
+Rivault's promises: the optional save-to-vault UX (forcing the user
+to retype on every future task) and transcript redaction (chat-
+typed values stay in the transcript forever).
+
+**Daemon (MCP server)**
+- **Orchestration instructions** rewritten. New step 2 explicitly
+  requires `rivault_request_form` (single missing field) or
+  `rivault_request_hybrid` (multiple missing fields, or a mix with
+  L2 items) whenever `rivault_check` returns no match, and labels
+  asking in chat as the #2 misuse. Existing steps renumbered.
+- **`rivault_check` tool description** now spells out the on-MATCH
+  vs on-NO-MATCH next steps directly, so the model sees the rule
+  on every call instead of relying on the run-once instructions
+  block being remembered.
+
+---
+
 ## v0.3.6 — 2026-05-14
 
 L2 envelope decryption was broken for OpenClaw users since v0.3.0
