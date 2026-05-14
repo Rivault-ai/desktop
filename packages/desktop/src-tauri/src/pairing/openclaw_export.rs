@@ -130,6 +130,22 @@ pub fn install_and_configure(
         .args(["plugins", "uninstall", "rivault", "--force"])
         .output();
 
+    // Belt-and-suspenders. `openclaw plugins uninstall --force` clears
+    // the openclaw.json records (plugins.{allow,entries,installs}) but
+    // in several edge cases leaves `~/.openclaw/extensions/rivault/`
+    // behind — most reliably when the install record was already
+    // cleared by an earlier call, which causes uninstall to refuse
+    // with "Plugin 'rivault' is not managed by plugins config/install
+    // records". The next `plugins install` then fails with "plugin
+    // already exists: ... (delete it first)". Same workaround
+    // install.sh uses in its uninstall branch.
+    if let Some(home) = dirs::home_dir() {
+        let ext = home.join(".openclaw").join("extensions").join("rivault");
+        if ext.exists() {
+            let _ = fs::remove_dir_all(&ext);
+        }
+    }
+
     let install_out = Command::new(&cli)
         .args(["plugins", "install"])
         .arg(&skill_dir)

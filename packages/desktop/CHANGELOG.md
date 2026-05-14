@@ -10,6 +10,25 @@ breaking changes to the daemon's release-event contract.
 
 ---
 
+## v0.3.5 — 2026-05-13
+
+Sign-In no longer leaves the OpenClaw plugin in a broken half-state
+on re-pair.
+
+**Daemon**
+- **Belt-and-suspenders `rm -rf` for the extension dir** added to
+  `install_and_configure`, between the `uninstall --force` and
+  `install` calls. `openclaw plugins uninstall --force` clears the
+  `plugins.{allow,entries,installs}` records in `openclaw.json` but
+  leaves `~/.openclaw/extensions/rivault/` behind whenever the
+  install record was already missing — the next
+  `openclaw plugins install` then refuses with "plugin already
+  exists: ... (delete it first)" and Sign-In silently fails to
+  re-register the plugin. Same workaround `install.sh` has had in
+  its uninstall branch since v0.3.0; the daemon needed it too.
+
+---
+
 ## v0.3.4 — 2026-05-13
 
 Sign-in's OpenClaw plumbing is now persona-aware: users without
