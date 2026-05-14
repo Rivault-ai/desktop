@@ -10,6 +10,46 @@ breaking changes to the daemon's release-event contract.
 
 ---
 
+## v0.3.6 — 2026-05-14
+
+L2 envelope decryption was broken for OpenClaw users since v0.3.0
+because both `install.sh` and the daemon's Sign-In path were writing
+`apiUrl: "https://api.rivault.ai"` into the OpenClaw plugin config.
+
+**The bug**: the plugin's `dist/index.js:106` reads
+`const apiBaseUrl = cfg.apiUrl ?? config.apiBaseUrl;`. When `cfg.apiUrl`
+is set it short-circuits `config.apiBaseUrl`'s daemon-discovery logic
+(`~/Library/Application Support/Rivault/daemon.json`), so every plugin
+call goes direct to `api.rivault.ai` and the local daemon never sees
+the request. Direct-to-cloud is fine for L1 retrieval, but L2 flows
+fail: the daemon (not the cloud server) is the side that mints
+ephemeral P-256 keypairs and attaches the public key when creating
+the auth/hybrid request — bypassing it means the user-side encrypted
+envelope returned by the cloud has no matching private key to decrypt
+against, and the daemon emits `no keypair stored for request_id=…;
+daemon restart between create and poll?` from `upstream/client.rs:275`.
+The LLM-facing surface called this "plugin is failing to attach the
+encryption keypair".
+
+**Fix**: stop writing `apiUrl` to `plugins.entries.rivault.config`.
+
+**Daemon**
+- `install_and_configure(api_key, bundled_skill_dir)` no longer takes
+  a `base_url`. `write_credentials_only` writes `apiKey` only and
+  *scrubs any pre-existing `apiUrl`* so upgrades from v0.3.5 and
+  earlier flush the bad value on the next pair/sign-in.
+
+**install.sh**
+- The Python config-writer no longer sets `apiUrl`; it actively
+  `pop`s the field for the same upgrade-cleanup reason. Comment in
+  the source now explains why future contributors must not add it
+  back.
+
+Power users who actually need a non-default API URL can still set
+`RIVAULT_API_URL` — that path is unchanged.
+
+---
+
 ## v0.3.5 — 2026-05-13
 
 Sign-In no longer leaves the OpenClaw plugin in a broken half-state
