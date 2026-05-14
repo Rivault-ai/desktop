@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "pnpm prepare-skill-bundle && tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "prepare-skill-bundle": "rm -rf skill-bundle && pnpm --filter rivault deploy --prod --legacy skill-bundle && rm -rf skill-bundle/src skill-bundle/scripts"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.8",

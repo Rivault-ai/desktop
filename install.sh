@@ -130,7 +130,7 @@ PY
     # Unregister the OpenClaw plugin first so `openclaw plugins list`
     # doesn't keep showing a stale entry pointing at a path we may be
     # about to delete. Best-effort: openclaw not installed is fine.
-    if command -v openclaw >/dev/null 2>&1; then
+    if command -v openclaw >/dev/null 2>&1 && [ -f "${HOME}/.openclaw/openclaw.json" ]; then
         openclaw plugins uninstall rivault --force >/dev/null 2>&1 \
             && green "  unregistered OpenClaw plugin" \
             || true
@@ -227,11 +227,16 @@ ditto "$TMPDIR_/extract/skill" "$SKILL_DIR"
 # `openclaw plugins install <dir>` copies into ~/.openclaw/extensions/
 # AND registers the plugin in ~/.openclaw/openclaw.json (entries +
 # installs + allow). Idempotent: re-running just refreshes the install.
-if command -v openclaw >/dev/null 2>&1; then
-    echo "  Registering OpenClaw plugin..."
-    # Idempotency: `openclaw plugins install` refuses to overwrite an
-    # existing ~/.openclaw/extensions/<id> dir, so uninstall first so
-    # re-running install.sh always lands a fresh, current bundle.
+# HAS_OPENCLAW: detect whether the user is an OpenClaw user. CLI on PATH
+# isn't enough (could be brew-installed but never run); we also need the
+# config file the gateway creates on first run. If both present, install
+# the rivault plugin. Otherwise leave openclaw alone — this user is on
+# Claude / Codex / another MCP runtime and doesn't need the plugin.
+if command -v openclaw >/dev/null 2>&1 && [ -f "${HOME}/.openclaw/openclaw.json" ]; then
+    echo "  OpenClaw detected; registering plugin..."
+    # `openclaw plugins install` refuses to overwrite an existing
+    # ~/.openclaw/extensions/<id> dir, so uninstall first so re-running
+    # install.sh always lands a fresh, current bundle.
     openclaw plugins uninstall rivault --force >/dev/null 2>&1 || true
     if openclaw plugins install "$SKILL_DIR" >/dev/null 2>&1; then
         green "  registered as OpenClaw plugin"
@@ -240,8 +245,10 @@ if command -v openclaw >/dev/null 2>&1; then
         warn "  to retry manually: openclaw plugins install $SKILL_DIR"
     fi
 else
-    warn "  openclaw not in PATH — Rivault tools won't load until you install OpenClaw"
-    warn "  after installing OpenClaw, run: openclaw plugins install $SKILL_DIR"
+    # No OpenClaw — skip silently. The desktop daemon and Claude/Codex
+    # MCP entries are sufficient on their own; we'd just spam warnings
+    # at users who don't use OpenClaw.
+    :
 fi
 
 mkdir -p "$SUPPORT_DIR"

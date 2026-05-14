@@ -172,16 +172,24 @@ async fn save_config(
             "save_config wrote config.json but upstream client init failed: {e:#}"
         ),
     }
-    // Mirror the key into OpenClaw's plugin config so a returning
-    // OpenClaw user doesn't have to re-paste it in a separate place
-    // (or re-run install.sh interactively) to get the JS tools
-    // authenticated. Best-effort: OpenClaw not installed → Ok(false),
-    // not an error.
-    match crate::pairing::openclaw_export::write_credentials(&api_key, &base) {
-        Ok(true) => tracing::info!("openclaw plugin config updated with new key"),
-        Ok(false) => {} // openclaw not installed; nothing to mirror
+    // Install + configure the OpenClaw plugin if the user has OpenClaw.
+    // Mirrors what install.sh's interactive path does: `openclaw plugins
+    // install` + write apiKey into the plugin config. No-op for MCP-only
+    // users (the daemon's `config.json` is enough for Claude clients).
+    let bundled_skill = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|d| d.join("skill"));
+    match crate::pairing::openclaw_export::install_and_configure(
+        &api_key,
+        &base,
+        bundled_skill.as_deref(),
+    ) {
+        Ok(true) => tracing::info!("openclaw plugin installed + configured for save_config"),
+        Ok(false) => {} // user doesn't have openclaw — nothing to do
         Err(e) => tracing::warn!(
-            "save_config could not update openclaw.json (continuing): {e:#}"
+            "save_config could not configure openclaw plugin (continuing): {e:#}"
         ),
     }
     enable_autostart_silent(&app);
@@ -243,6 +251,46 @@ async fn start_pairing(
                     };
                     match config::save(&cfg) {
                         Ok(()) => {
+                            // Same dual-write the paste-key path
+                            // (save_config) does: hot-install the upstream
+                            // client into the MCP cell and mirror the key
+                            // into OpenClaw's plugin config. Without these,
+                            // a user who pairs via Sign-In ends up with a
+                            // configured config.json but an empty MCP cell
+                            // (router 401s tool calls until restart) and
+                            // no OpenClaw plugin credentials.
+                            match crate::upstream::UpstreamClient::new(base.clone(), api_key.clone()) {
+                                Ok(client) => {
+                                    *state
+                                        .upstream_cell
+                                        .write()
+                                        .expect("upstream cell lock poisoned") = Some(client);
+                                    tracing::info!(
+                                        "upstream client hot-installed after start_pairing"
+                                    );
+                                }
+                                Err(e) => tracing::warn!(
+                                    "start_pairing wrote config but upstream init failed: {e:#}"
+                                ),
+                            }
+                            let bundled_skill = app
+                                .path()
+                                .resource_dir()
+                                .ok()
+                                .map(|d| d.join("skill"));
+                            match crate::pairing::openclaw_export::install_and_configure(
+                                &api_key,
+                                &base,
+                                bundled_skill.as_deref(),
+                            ) {
+                                Ok(true) => tracing::info!(
+                                    "openclaw plugin installed + configured for start_pairing"
+                                ),
+                                Ok(false) => {}
+                                Err(e) => tracing::warn!(
+                                    "start_pairing could not configure openclaw plugin: {e:#}"
+                                ),
+                            }
                             enable_autostart_silent(&app);
                             Ok(ConfigStatus {
                                 configured: true,

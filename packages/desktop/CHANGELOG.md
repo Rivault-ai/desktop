@@ -10,6 +10,42 @@ breaking changes to the daemon's release-event contract.
 
 ---
 
+## v0.3.4 — 2026-05-13
+
+Sign-in's OpenClaw plumbing is now persona-aware: users without
+OpenClaw installed never see plugin churn, and users who installed
+the .app directly (no `install.sh`) still get the skill provisioned
+from the bundled resources.
+
+**Daemon**
+- **`pairing::openclaw_export::install_and_configure`** replaces the
+  old `write_credentials`. It first checks `has_openclaw()` — both
+  `openclaw` on `PATH` AND `~/.openclaw/openclaw.json` present — and
+  returns `Ok(false)` silently if either is missing. For users who do
+  have OpenClaw, it runs the full CLI flow (`plugins uninstall
+  --force` then `plugins install`) before writing the `apiKey` and
+  `apiUrl` into `openclaw.json`. Idempotent: re-pair clears the old
+  plugin entry before installing the fresh one.
+- **Bundled skill fallback.** When `~/.openclaw/skills/rivault/` is
+  absent (e.g. the user installed via the .app download rather than
+  `install.sh`), the daemon falls back to
+  `Contents/Resources/skill/` inside its own bundle. The
+  `prepare-skill-bundle` script in `packages/desktop/package.json`
+  stages the production skill payload there at build time via Tauri's
+  `bundle.resources` glob.
+- **`clear_credentials()`** added for future sign-out support; only
+  clears `apiKey`/`apiUrl` and leaves `enabled: true` so the user
+  doesn't have to re-toggle the plugin on next sign-in.
+
+**install.sh**
+- **`HAS_OPENCLAW` check tightened** in both the install and
+  uninstall branches to require both the CLI on `PATH` AND
+  `~/.openclaw/openclaw.json` to exist before touching plugin
+  config. MCP-only users (Claude Desktop / Code / Codex without
+  OpenClaw) now see zero OpenClaw output during install.
+
+---
+
 ## v0.3.3 — 2026-05-13
 
 Pair-your-Mac flow now uses a custom URL scheme so browser extensions
